@@ -23,8 +23,10 @@ from contextlib import contextmanager
 from tqdm import tqdm
 
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+import numpy as np
 import insightface
 from insightface.app import FaceAnalysis
+from insightface.app.common import Face
 from cv2 import imread, imwrite, VideoCapture, CAP_PROP_FPS
 
 # Constant directories
@@ -147,15 +149,138 @@ def cleanup(audio_path: str | None = None):
         except OSError:
             pass
 
-def get_random_kirk_face(faceanalysis: FaceAnalysis):
-    """Get a random Kirk face, ensuring it has a detected face"""
-    for _ in range(3):  # Try up to 3 times
-        kirk_path = KIRKS_DIR / f'kirk_{randint(0, 2)}.jpg'
+def get_canonical_kirk_face(faceanalysis: FaceAnalysis):
+    """
+    Computes an averaged, normalized identity embedding from all available Kirk reference images.
+    This guarantees that the target face identity embedding remains constant and jitter-free.
+    """
+    embeddings = []
+    best_face = None
+    best_score = -1.0
+
+    for i in range(3):
+        kirk_path = KIRKS_DIR / f'kirk_{i}.jpg'
+        if not kirk_path.exists():
+            continue
         kirk_img = imread(str(kirk_path))
+        if kirk_img is None:
+            continue
         faces = faceanalysis.get(kirk_img)
         if faces:
-            return faces[0]
-    raise RuntimeError("Could not detect a face in any Kirk image")
+            face = faces[0]
+            embeddings.append(face.normed_embedding)
+            score = getattr(face, 'det_score', 0.0)
+            if score > best_score:
+                best_score = score
+                best_face = face
+
+    if best_face is None or not embeddings:
+        raise RuntimeError("Could not detect a face in any Kirk reference image")
+
+    avg_emb = np.mean(embeddings, axis=0)
+    avg_emb /= np.linalg.norm(avg_emb)
+
+    canonical_face = Face(best_face)
+    canonical_face.embedding = avg_emb
+    return canonical_face
+
+class FaceTracker:
+    """
+    Temporal Face Tracker and Stabilizer for video processing.
+    Eliminates flickering through:
+    1. Adaptive Exponential Smoothing on facial landmarks (kps) and bounding box (bbox)
+       to remove high-frequency neural net detection jitter.
+    2. Missed-detection recovery (grace period) preventing single-frame dropped face flicker.
+    3. Spatial IoU + centroid tracking to ensure consistent face-to-identity assignment across frames.
+    """
+    def __init__(self, alpha: float = 0.60, max_missed: int = 2, iou_thresh: float = 0.25):
+        self.alpha = alpha
+        self.max_missed = max_missed
+        self.iou_thresh = iou_thresh
+        self.tracks: list[dict] = []
+        self.next_id = 0
+
+    @staticmethod
+    def compute_iou(boxA, boxB):
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+
+        interArea = max(0.0, xB - xA) * max(0.0, yB - yA)
+        boxAArea = max(0.0, (boxA[2] - boxA[0])) * max(0.0, (boxA[3] - boxA[1]))
+        boxBArea = max(0.0, (boxB[2] - boxB[0])) * max(0.0, (boxB[3] - boxB[1]))
+
+        unionArea = boxAArea + boxBArea - interArea
+        return interArea / unionArea if unionArea > 0 else 0.0
+
+    def update(self, detected_faces: list) -> list:
+        matched_track_indices = set()
+        matched_det_indices = set()
+
+        if self.tracks and detected_faces:
+            pairs = []
+            for t_idx, track in enumerate(self.tracks):
+                track_center = np.mean(track['kps'], axis=0)
+                for d_idx, det in enumerate(detected_faces):
+                    iou = self.compute_iou(track['bbox'], det.bbox)
+                    det_center = np.mean(det.kps, axis=0)
+                    dist = np.linalg.norm(track_center - det_center)
+                    if iou >= self.iou_thresh or dist < 60:
+                        score = iou + max(0.0, 1.0 - (dist / 120.0))
+                        pairs.append((score, t_idx, d_idx))
+
+            pairs.sort(key=lambda x: x[0], reverse=True)
+            for _, t_idx, d_idx in pairs:
+                if t_idx not in matched_track_indices and d_idx not in matched_det_indices:
+                    matched_track_indices.add(t_idx)
+                    matched_det_indices.add(d_idx)
+                    track = self.tracks[t_idx]
+                    det = detected_faces[d_idx]
+
+                    # Adaptive smoothing: snap if large sudden movement, smooth if small jitter
+                    diff = np.linalg.norm(det.kps - track['kps'])
+                    if diff > 80:
+                        a = 1.0
+                    elif diff > 30:
+                        a = 0.85
+                    else:
+                        a = self.alpha
+
+                    track['kps'] = a * det.kps + (1.0 - a) * track['kps']
+                    track['bbox'] = a * det.bbox + (1.0 - a) * track['bbox']
+                    track['missed'] = 0
+                    track['last_face'] = det
+
+        # Register new detected faces that didn't match existing tracks
+        for d_idx, det in enumerate(detected_faces):
+            if d_idx not in matched_det_indices:
+                self.tracks.append({
+                    'id': self.next_id,
+                    'bbox': det.bbox.copy(),
+                    'kps': det.kps.copy(),
+                    'missed': 0,
+                    'last_face': det
+                })
+                self.next_id += 1
+
+        # Handle unmatched tracks (grace period for temporarily dropped detections)
+        active_tracks = []
+        for t_idx, track in enumerate(self.tracks):
+            if t_idx not in matched_track_indices:
+                track['missed'] += 1
+            if track['missed'] <= self.max_missed:
+                active_tracks.append(track)
+        self.tracks = active_tracks
+
+        # Return stabilized face objects for the current frame
+        stabilized = []
+        for track in self.tracks:
+            f = Face(track['last_face'])
+            f.kps = track['kps'].copy()
+            f.bbox = track['bbox'].copy()
+            stabilized.append(f)
+        return stabilized
 
 def kirkify_frame(frame_path: str, output_path: str, faceanalysis: FaceAnalysis, swapper, kirk_face):
     """Process a single frame"""
@@ -164,52 +289,72 @@ def kirkify_frame(frame_path: str, output_path: str, faceanalysis: FaceAnalysis,
         raise FileNotFoundError(f"Could not read image: {frame_path}")
     faces = faceanalysis.get(img)
 
-    if faces:  # Only process if faces detected
+    if faces:
         res = img.copy()
         for face in faces:
             res = swapper.get(res, face, kirk_face, paste_back=True)
         
-        import numpy as np
         if not isinstance(res, np.ndarray):
             res = np.array(res)
         imwrite(output_path, res)
         return True
     else:
-        import numpy as np
         if not isinstance(img, np.ndarray):
             img = np.array(img)
         imwrite(output_path, img)
         return False
 
-def process_all_frames(faceanalysis: FaceAnalysis, swapper, frame_step: int = 1, workers: int | None = None) -> dict:
-    """Process each frame in unprocessed_frames/ with tqdm progress bar
-    - frame_step: process 1 of every N frames (skip to speed up)
-    - workers: number of threads for parallel processing
+def process_all_frames(faceanalysis: FaceAnalysis, swapper, kirk_face, frame_step: int = 1, workers: int | None = None, smooth: bool = True) -> dict:
+    """Process each frame in unprocessed_frames/ with tqdm progress bar.
+    - smooth: enables temporal face tracking and landmark smoothing to eliminate flickering.
+    - frame_step: process 1 of every N frames (skip to speed up).
+    - workers: number of threads for parallel processing (used when smooth=False).
     """
     PROCESSED_DIR.mkdir(exist_ok=True)
     all_files = sorted([f for f in os.listdir(UNPROCESSED_DIR) if f.endswith('.png')])
     frame_files = all_files[::max(1, frame_step)]
-    kirk_face = get_random_kirk_face(faceanalysis)
-
-    def _process(idx_and_name: tuple[int, str]) -> bool:
-        idx, filename = idx_and_name
-        input_path = str(UNPROCESSED_DIR / filename)
-        # Renumber output to be contiguous: frame_0000, 0001, ...
-        output_path = str(PROCESSED_DIR / f"frame_{idx:04d}.png")
-        return kirkify_frame(input_path, output_path, faceanalysis, swapper, kirk_face)
-
     total = len(frame_files)
-    workers = workers or max(1, os.cpu_count() or 1)
     with_faces = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(_process, (i, fn)) for i, fn in enumerate(frame_files)]
-        for fut in tqdm(as_completed(futures), total=total, desc="Processing frames", unit="frame"):
-            try:
-                if fut.result():
-                    with_faces += 1
-            except Exception:
-                # If a frame fails, count it as no-face and continue
-                pass
+
+    if smooth:
+        tracker = FaceTracker(alpha=0.60, max_missed=2)
+        desc = "Processing frames (stabilized)"
+        for idx, filename in enumerate(tqdm(frame_files, total=total, desc=desc, unit="frame")):
+            input_path = str(UNPROCESSED_DIR / filename)
+            output_path = str(PROCESSED_DIR / f"frame_{idx:04d}.png")
+            
+            img = imread(input_path)
+            if img is None:
+                continue
+
+            detected_faces = faceanalysis.get(img)
+            stabilized_faces = tracker.update(detected_faces)
+
+            if stabilized_faces:
+                with_faces += 1
+                res = img.copy()
+                for face in stabilized_faces:
+                    res = swapper.get(res, face, kirk_face, paste_back=True)
+                imwrite(output_path, res)
+            else:
+                imwrite(output_path, img)
+
+    else:
+        def _process(idx_and_name: tuple[int, str]) -> bool:
+            idx, filename = idx_and_name
+            input_path = str(UNPROCESSED_DIR / filename)
+            output_path = str(PROCESSED_DIR / f"frame_{idx:04d}.png")
+            return kirkify_frame(input_path, output_path, faceanalysis, swapper, kirk_face)
+
+        workers = workers or max(1, os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_process, (i, fn)) for i, fn in enumerate(frame_files)]
+            for fut in tqdm(as_completed(futures), total=total, desc="Processing frames", unit="frame"):
+                try:
+                    if fut.result():
+                        with_faces += 1
+                except Exception:
+                    pass
 
     return {'total': len(all_files), 'processed': len(frame_files), 'with_faces': with_faces}
 
@@ -217,9 +362,10 @@ SUPPORTED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif
 SUPPORTED_VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm', '.m4v'}
 SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
 
-def kirkify_video(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, frame_step: int = 1, workers: int | None = None):
+def kirkify_video(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, frame_step: int = 1, workers: int | None = None, smooth: bool = True):
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     audio_path = None
+    kirk_face = get_canonical_kirk_face(FACE_ANALYSIS)
     try:
         print("Extracting frames...")
         extract_frames(TARGET_PATH)
@@ -227,8 +373,8 @@ def kirkify_video(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, frame_s
         print("Extracting audio...")
         audio_path = extract_audio(TARGET_PATH)
         
-        print("Processing frames...")
-        stats = process_all_frames(FACE_ANALYSIS, FACE_SWAPPER, frame_step=frame_step, workers=workers)
+        print("Processing frames..." + (" (temporal stabilization ON)" if smooth else " (stabilization OFF)"))
+        stats = process_all_frames(FACE_ANALYSIS, FACE_SWAPPER, kirk_face, frame_step=frame_step, workers=workers, smooth=smooth)
         print(f"  Frames: total {stats['total']}, processed {stats['processed']}, with faces {stats['with_faces']}")
         
         print("Reconstructing video...")
@@ -242,7 +388,7 @@ def kirkify_video(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, frame_s
 
 def kirkify_image(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER):
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
-    kirk_face = get_random_kirk_face(FACE_ANALYSIS)
+    kirk_face = get_canonical_kirk_face(FACE_ANALYSIS)
 
     print("Kirkifying image...")
     face_detected = kirkify_frame(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, kirk_face)
@@ -263,6 +409,7 @@ def main():
     fast = '--fast' in args
     use_gpu = '--gpu' in args
     use_cpu = '--cpu' in args
+    smooth = '--no-smooth' not in args
     step = 1
     workers = None
 
@@ -400,7 +547,7 @@ def main():
                 if is_img:
                     kirkify_image(str(src_file), str(dst_file), face_analysis, face_swapper)
                 else:
-                    kirkify_video(str(src_file), str(dst_file), face_analysis, face_swapper, frame_step=step, workers=workers)
+                    kirkify_video(str(src_file), str(dst_file), face_analysis, face_swapper, frame_step=step, workers=workers, smooth=smooth)
             except Exception as e:
                 print(f"  [ERRORE] Durante l'elaborazione di {src_file.name}: {e}")
 

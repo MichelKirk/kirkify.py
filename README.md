@@ -87,24 +87,29 @@ The script supports several flags to speed up processing and to select the compu
 
 - `--fast`: Use a smaller face detector size (320x320) to speed up detection (slight quality trade-off).
 - `--frame-step N`: Process 1 out of every N frames (video only). Frames are renumbered to keep the output sequence contiguous.
-- `--workers M`: Use M threads to process frames in parallel (video only). A good default is the number of CPU cores.
+- `--workers M`: Use M threads to process frames in parallel (used when `--no-smooth` is specified).
 - `--gpu`: Prefer GPU for face detection and INSwapper when available.
 - `--cpu`: Force CPU even if a GPU is present.
+- `--no-smooth`: Disable temporal anti-flicker stabilization (temporal smoothing is ON by default).
 
 Examples (cmd/PowerShell):
 
 ```bash
-# Fast mode using GPU if available
+# Fast mode using GPU with anti-flicker stabilization (default)
 python kirkify.py input.mp4 output.mp4 --fast --gpu
 
-# Skip frames to speed up and parallelize on 8 threads
-python kirkify.py input.mp4 output.mp4 --fast --frame-step 3 --workers 8 --gpu
+# Process entire input/ folder to output/ folder with GPU
+python kirkify.py --gpu --fast
+
+# Skip frames to speed up
+python kirkify.py input.mp4 output.mp4 --fast --frame-step 3 --gpu
 
 # Force CPU and keep full quality detector
 python kirkify.py input.mp4 output.mp4 --cpu
 ```
 
 Notes:
+- **Anti-Flicker Temporal Stabilization**: Enabled by default for all video processing. It uses adaptive exponential landmark smoothing (One Euro principle), missed-detection recovery (preventing 1-frame blink glitches), and multi-Kirk embedding averaging to produce smooth, jitter-free face swaps.
 - Supported image formats: `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tiff`, `.tif`.
 - Supported video formats: `.mp4`, `.mov`, `.avi`, `.mkv`, `.flv`, `.wmv`, `.webm`, `.m4v`.
 - GPU mode requires ONNX Runtime GPU (`onnxruntime-gpu`) installed and a compatible NVIDIA driver. If `--gpu` is requested but CUDA is not available, the script will fall back to CPU and print a warning.
