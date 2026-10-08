@@ -62,13 +62,28 @@ If CUDA is not available, the script will fall back to CPU and print a warning.
 
 ## Usage
 
+### 1. Batch Mode (input/ -> output/)
+Place all your videos and images inside the `input/` folder, then run:
+
 ```bash
-python3 kirkify.py <input_media> [output_path]
+python kirkify.py --gpu --fast
+```
+Every supported file will be processed and saved into the `output/` folder. The AI models are loaded once into memory, making batch processing fast.
+
+### 2. Single File Mode
+You can process a single image or video. If no output path is specified, it will be saved into the `output/` folder by default:
+
+```bash
+# Saves automatically to output/photo.jpg
+python kirkify.py photo.jpg --gpu
+
+# Or specify a custom output path
+python kirkify.py photo.jpg result.jpg --gpu
 ```
 
 ### Performance and Device Flags
 
-The script supports several flags to speed up processing and to select the compute device. These are optional and can be combined.
+The script supports several flags to speed up processing and to select the compute device. These are optional and can be combined:
 
 - `--fast`: Use a smaller face detector size (320x320) to speed up detection (slight quality trade-off).
 - `--frame-step N`: Process 1 out of every N frames (video only). Frames are renumbered to keep the output sequence contiguous.
@@ -90,6 +105,8 @@ python kirkify.py input.mp4 output.mp4 --cpu
 ```
 
 Notes:
-- GPU mode requires ONNX Runtime GPU (onnxruntime-gpu) installed and a compatible NVIDIA driver. If `--gpu` is requested but CUDA is not available, the script will fall back to CPU and print a warning.
-- When using `--frame-step`, only the selected frames are processed; the output video remains valid because frames are renumbered sequentially.
-- `ffmpeg` must be installed and available in your PATH.
+- Supported image formats: `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tiff`, `.tif`.
+- Supported video formats: `.mp4`, `.mov`, `.avi`, `.mkv`, `.flv`, `.wmv`, `.webm`, `.m4v`.
+- GPU mode requires ONNX Runtime GPU (`onnxruntime-gpu`) installed and a compatible NVIDIA driver. If `--gpu` is requested but CUDA is not available, the script will fall back to CPU and print a warning.
+- Videos without audio streams are automatically handled without errors.
+- `ffmpeg` must be installed (automatically detected if installed via `winget install Gyan.FFmpeg.Essentials`).

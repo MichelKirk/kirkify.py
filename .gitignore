@@ -18,3 +18,10 @@ tests/
 
 inswapper_128.onnx
 audio.aac
+
+# Local input/output directories and temporary artifacts
+input/
+output/
+*.mp4
+kirky.bat
+.vscode/
