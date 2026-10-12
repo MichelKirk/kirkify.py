@@ -36,6 +36,10 @@ UNPROCESSED_DIR = Path('unprocessed_frames')
 PROCESSED_DIR = Path('processed_frames')
 KIRKS_DIR = Path('kirks')
 
+SUPPORTED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
+SUPPORTED_VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm', '.m4v'}
+SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
+
 # Utilities for ONNX Runtime/GPU verification
 def ort_available_and_providers() -> tuple[bool, list[str]]:
     try:
@@ -174,25 +178,45 @@ def cleanup(audio_path: str | None = None):
         except OSError:
             pass
 
-def get_canonical_kirk_face(faceanalysis: FaceAnalysis):
+def get_canonical_kirk_face(faceanalysis: FaceAnalysis, source: Path | str = KIRKS_DIR):
     """
-    Computes an averaged, normalized identity embedding from all available Kirk reference images.
+    Computes an averaged, normalized identity embedding from reference face images.
+    `source` can be a single image file or a directory containing one or more images.
+    Supports any image format (.jpg, .jpeg, .png, .webp, .bmp).
     This guarantees that the target face identity embedding remains constant and jitter-free.
     """
+    source_p = Path(source)
+    candidates: list[Path] = []
+
+    if source_p.is_file():
+        candidates.append(source_p)
+    elif source_p.is_dir():
+        # First priority: legacy kirk_0, kirk_1, kirk_2 if present
+        for i in range(10):
+            p = source_p / f'kirk_{i}.jpg'
+            if p.exists() and p not in candidates:
+                candidates.append(p)
+        # Collect all valid image files in the directory
+        for p in sorted(source_p.iterdir()):
+            if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS:
+                if p not in candidates:
+                    candidates.append(p)
+
+    if not candidates:
+        raise FileNotFoundError(f"Nessuna immagine trovata in '{source_p}'. Inserisci una o piu' foto (.jpg, .png, .webp) del volto da applicare.")
+
     embeddings = []
     best_face = None
     best_score = -1.0
 
-    for i in range(3):
-        kirk_path = KIRKS_DIR / f'kirk_{i}.jpg'
-        if not kirk_path.exists():
+    for img_path in candidates:
+        img = imread(str(img_path))
+        if img is None:
             continue
-        kirk_img = imread(str(kirk_path))
-        if kirk_img is None:
-            continue
-        faces = faceanalysis.get(kirk_img)
+        faces = faceanalysis.get(img)
         if faces:
-            face = faces[0]
+            # Pick highest confidence detected face in the reference photo
+            face = max(faces, key=lambda f: getattr(f, 'det_score', 0.0))
             embeddings.append(face.normed_embedding)
             score = getattr(face, 'det_score', 0.0)
             if score > best_score:
@@ -200,7 +224,7 @@ def get_canonical_kirk_face(faceanalysis: FaceAnalysis):
                 best_face = face
 
     if best_face is None or not embeddings:
-        raise RuntimeError("Could not detect a face in any Kirk reference image")
+        raise RuntimeError(f"Impossibile rilevare un volto nelle immagini di riferimento in '{source_p}'. Assicurati che il viso sia ben visibile e illuminato.")
 
     avg_emb = np.mean(embeddings, axis=0)
     avg_emb /= np.linalg.norm(avg_emb)
@@ -208,6 +232,7 @@ def get_canonical_kirk_face(faceanalysis: FaceAnalysis):
     canonical_face = Face(best_face)
     canonical_face.embedding = avg_emb
     return canonical_face
+
 
 class FaceTracker:
     """
@@ -482,10 +507,6 @@ def process_all_frames(faceanalysis: FaceAnalysis, swapper, kirk_face, frame_ste
 
     return {'total': total, 'processed': total, 'with_faces': with_faces}
 
-SUPPORTED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
-SUPPORTED_VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm', '.m4v'}
-SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
-
 def kirkify_video(
     TARGET_PATH,
     OUTPUT_PATH,
@@ -497,11 +518,14 @@ def kirkify_video(
     enhancer: GFPGANEnhancer | None = None,
     target_fps: float | None = None,
     scale: float = 1.0,
-    crf: int = 15
+    crf: int = 15,
+    kirk_face: Face | None = None,
+    source_face: Path | str = KIRKS_DIR,
 ):
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     audio_path = None
-    kirk_face = get_canonical_kirk_face(FACE_ANALYSIS)
+    if kirk_face is None:
+        kirk_face = get_canonical_kirk_face(FACE_ANALYSIS, source=source_face)
     try:
         print("Extracting frames (lossless)...")
         extract_frames(TARGET_PATH)
@@ -531,10 +555,13 @@ def kirkify_image(
     FACE_ANALYSIS,
     FACE_SWAPPER,
     enhancer: GFPGANEnhancer | None = None,
-    scale: float = 1.0
+    scale: float = 1.0,
+    kirk_face: Face | None = None,
+    source_face: Path | str = KIRKS_DIR,
 ):
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
-    kirk_face = get_canonical_kirk_face(FACE_ANALYSIS)
+    if kirk_face is None:
+        kirk_face = get_canonical_kirk_face(FACE_ANALYSIS, source=source_face)
 
     print("Kirkifying image in ultra-high quality...")
     img = imread(TARGET_PATH)
@@ -582,6 +609,7 @@ def main():
     scale = 1.0
     custom_fps = None
     crf = 15
+    source_face_path = KIRKS_DIR
 
     positional = []
     i = 0
@@ -589,6 +617,12 @@ def main():
         arg = args[i]
         if arg in ('--fast', '--gpu', '--cpu', '--no-smooth', '--enhance', '--no-enhance'):
             i += 1
+        elif arg in ('--face', '--source', '--source-face'):
+            if i + 1 < len(args) and not args[i+1].startswith('-'):
+                source_face_path = Path(args[i+1])
+                i += 2
+            else:
+                i += 1
         elif arg == '--frame-step':
             if i + 1 < len(args):
                 try:
@@ -744,6 +778,10 @@ def main():
     else:
         print("[INFO] High-frequency texture & unsharp detail restoration active.")
 
+    print(f"Loading reference face from '{source_face_path}'...")
+    canonical_kirk_face = get_canonical_kirk_face(face_analysis, source=source_face_path)
+    print("Reference face loaded successfully!")
+
     total_items = len(items_to_process)
     if total_items > 1:
         print(f"\n--- Inizio elaborazione di {total_items} file (minimo 60fps per i video) ---")
@@ -754,7 +792,15 @@ def main():
                 print(f"\n[{idx}/{total_items}] Elaborazione: {src_file.name} -> {dst_file}")
             try:
                 if is_img:
-                    kirkify_image(str(src_file), str(dst_file), face_analysis, face_swapper, enhancer=enhancer, scale=scale)
+                    kirkify_image(
+                        str(src_file),
+                        str(dst_file),
+                        face_analysis,
+                        face_swapper,
+                        enhancer=enhancer,
+                        scale=scale,
+                        kirk_face=canonical_kirk_face
+                    )
                 else:
                     kirkify_video(
                         str(src_file),
@@ -767,10 +813,12 @@ def main():
                         enhancer=enhancer,
                         target_fps=custom_fps,
                         scale=scale,
-                        crf=crf
+                        crf=crf,
+                        kirk_face=canonical_kirk_face
                     )
             except Exception as e:
                 print(f"  [ERRORE] Durante l'elaborazione di {src_file.name}: {e}")
+
 
         if total_items > 1:
             print(f"\n--- Elaborazione completata! Tutti i file si trovano in: {output_dir_default.resolve()} ---")

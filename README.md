@@ -104,7 +104,28 @@ python kirkify.py --gpu
 
 # Process single photo in 4K/HD quality
 python kirkify.py photo.jpg --gpu --scale 2
+
+# Use a custom face/filter image or folder
+python kirkify.py --gpu --face path/to/my_face.jpg
 ```
+
+### Changing the Applied Face / Filter (Come Cambiare il Volto Applicato)
+
+Puoi cambiare il volto che viene applicato in due modi semplici:
+
+1. **Metodo 1: Sostituire le immagini nella cartella `kirks/` (Consigliato per batch/default)**
+   - Apri la cartella `kirks/`.
+   - Inserisci una o più foto (formati `.jpg`, `.png`, `.webp`) del nuovo volto che vuoi applicare (es. `mia_faccia.jpg`).
+   - Se inserisci più foto con angolazioni o espressioni diverse della stessa persona, l'algoritmo calcola una media matematica dei vettori facciali (canonical identity embedding), rendendo il face-swap ancora più preciso e stabile.
+
+2. **Metodo 2: Usare il parametro `--face` da riga di comando o in `.bat`**
+   - Puoi specificare direttamente qualsiasi file immagine o cartella senza toccare `kirks/`:
+     ```bash
+     python kirkify.py --gpu --face mia_foto.jpg
+     # oppure
+     python kirkify.py input.mp4 output.mp4 --gpu --face volti_nuovi/
+     ```
+
 
 Notes:
 - **Minimum 60 FPS Smooth Playback**: Output videos are automatically rendered at a minimum of 60 FPS (or the original framerate if higher) using lossless frame timing, completely eliminating lag and stutter.
