@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+
+{% block title %}Impostazioni{% endblock %}
+
+{% block content %}
+<div x-data="settingsApp()" class="space-y-8 max-w-4xl mx-auto">
+
+    <div>
+        <h1 class="text-2xl font-bold text-white flex items-center gap-3">
+            <i class="ph-bold ph-gear text-purple-400"></i> Impostazioni Piattaforma
+        </h1>
+        <p class="text-sm text-gray-400 mt-1">Configura la descrizione predefinita, gli orari di pubblicazione e i volti di riferimento.</p>
+    </div>
+
+    <!-- General Settings Form -->
+    <div class="card bg-[#161b22] border border-[#30363d] p-6 rounded-2xl shadow-xl">
+        <h2 class="text-lg font-bold text-white mb-4 flex items-center gap-2">
+            <i class="ph-bold ph-sliders-horizontal text-indigo-400"></i> Pubblicazione & Automazione
+        </h2>
+
+        <form @submit.prevent="saveSettings" class="space-y-6">
+            <div class="form-control">
+                <label class="label text-xs font-semibold text-gray-300">
+                    <span>Descrizione Predefinita Post Instagram</span>
+                    <span class="text-gray-500 text-xs">Verrà applicata a tutti i nuovi video generati</span>
+                </label>
+                <textarea x-model="form.defaultCaption" rows="4" class="textarea textarea-bordered w-full bg-[#0d1117] border-[#30363d] text-white text-sm focus:border-purple-500 font-sans"></textarea>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="form-control">
+                    <label class="label text-xs font-semibold text-gray-300">Orario Pubblicazione Giornaliera (HH:MM)</label>
+                    <input type="time" x-model="form.dailyPublishTime" class="input input-bordered w-full bg-[#0d1117] border-[#30363d] text-white focus:border-purple-500" />
+                    <span class="text-[11px] text-gray-500 mt-1">L'orario a cui il sistema pubblicherà 1 post al giorno.</span>
+                </div>
+
+                <div class="form-control justify-center pt-4">
+                    <label class="label cursor-pointer justify-start gap-4">
+                        <input type="checkbox" x-model="form.autoPublishEnabled" class="toggle toggle-primary" />
+                        <span class="label-text text-sm font-medium text-gray-200">Abilita Pubblicazione Automatica</span>
+                    </label>
+                    <span class="text-[11px] text-gray-500 ml-1">Se disattivato, i post rimarranno in coda senza essere pubblicati da soli.</span>
+                </div>
+            </div>
+
+            <div class="flex justify-end pt-4 border-t border-[#30363d]">
+                <button type="submit" :disabled="saving" class="btn btn-primary bg-gradient-to-r from-purple-600 to-indigo-600 border-none text-white shadow-lg shadow-purple-600/20">
+                    <span x-show="!saving"><i class="ph-bold ph-floppy-disk mr-1"></i> Salva Impostazioni</span>
+                    <span x-show="saving"><span class="loading loading-spinner loading-xs"></span> Salvataggio...</span>
+                </button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Reference Faces Manager -->
+    <div class="card bg-[#161b22] border border-[#30363d] p-6 rounded-2xl shadow-xl">
+        <div class="flex items-center justify-between mb-4">
+            <div>
+                <h2 class="text-lg font-bold text-white flex items-center gap-2">
+                    <i class="ph-bold ph-user-focus text-pink-400"></i> Volti di Riferimento (Cartella kirks/)
+                </h2>
+                <p class="text-xs text-gray-400 mt-1">Queste foto definiscono l'identità del volto applicato durante il face-swap.</p>
+            </div>
+            
+            <label class="btn btn-sm btn-outline border-[#30363d] text-gray-300 hover:text-white cursor-pointer">
+                <i class="ph-bold ph-upload-simple"></i> Carica Nuovo Volto
+                <input type="file" @change="uploadFace" class="hidden" accept="image/*" />
+            </label>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-2">
+            {% for face in face_files %}
+            <div class="group relative p-2 bg-[#0d1117] border border-[#30363d] rounded-xl overflow-hidden text-center" id="face-{{ face }}">
+                <div class="w-full h-32 rounded-lg bg-black overflow-hidden mb-2">
+                    <img src="/media/{{ face }}" class="w-full h-full object-cover" alt="{{ face }}" onerror="this.src='https://placehold.co/150x150/161b22/7c3aed?text=Face'" />
+                </div>
+                <p class="text-xs font-mono text-gray-400 truncate">{{ face }}</p>
+                <button @click="deleteFace('{{ face }}')" class="btn btn-xs btn-error btn-circle absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition shadow-lg" title="Elimina foto">
+                    <i class="ph-bold ph-trash"></i>
+                </button>
+            </div>
+            {% else %}
+            <div class="col-span-4 text-center py-8 text-gray-500 text-sm">
+                Nessun volto trovato in <code class="text-purple-400">kirks/</code>. Carica una o più foto chiare per iniziare il face-swap.
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <!-- Integrations Status & .env Guidance -->
+    <div class="card bg-[#161b22] border border-[#30363d] p-6 rounded-2xl shadow-xl">
+        <h2 class="text-lg font-bold text-white mb-4 flex items-center gap-2">
+            <i class="ph-bold ph-key text-yellow-400"></i> Credenziali e Stato Servizi (.env)
+        </h2>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+            <div class="p-4 bg-[#0d1117] border border-[#30363d] rounded-xl space-y-2">
+                <div class="flex items-center justify-between">
+                    <span class="font-bold text-white flex items-center gap-1.5">
+                        <i class="ph-bold ph-google-drive-logo text-base text-blue-400"></i> Google Drive
+                    </span>
+                    <span class="badge badge-sm {% if gdrive_configured %}badge-success{% else %}badge-warning{% endif %}">
+                        {{ 'Attivo' if gdrive_configured else 'Non Configurato' }}
+                    </span>
+                </div>
+                <p class="text-gray-400">Folder ID: <code class="text-gray-300">{{ gdrive_folder_id or 'Non impostato' }}</code></p>
+                <p class="text-gray-500 text-[11px]">Posiziona il file <code class="text-gray-400">service_account.json</code> dentro <code class="text-gray-400">data/</code> per abilitare il caricamento automatico sul cloud.</p>
+            </div>
+
+            <div class="p-4 bg-[#0d1117] border border-[#30363d] rounded-xl space-y-2">
+                <div class="flex items-center justify-between">
+                    <span class="font-bold text-white flex items-center gap-1.5">
+                        <i class="ph-bold ph-instagram-logo text-base text-pink-400"></i> Account Instagram
+                    </span>
+                    <span class="badge badge-sm {% if instagram_configured %}badge-info{% else %}badge-ghost{% endif %}">
+                        {{ 'Configurato' if instagram_configured else 'Non Configurato' }}
+                    </span>
+                </div>
+                <p class="text-gray-400">Username: <code class="text-gray-300">{{ instagram_user or 'Non impostato' }}</code></p>
+                <p class="text-gray-500 text-[11px]">Imposta <code class="text-gray-400">INSTAGRAM_USERNAME</code> e <code class="text-gray-400">PASSWORD</code> nel file <code class="text-gray-400">.env</code> per consentire l'auto-posting giornaliero.</p>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script>
+function settingsApp() {
+    return {
+        form: {
+            defaultCaption: {{ default_caption | tojson }},
+            dailyPublishTime: '{{ daily_publish_time }}',
+            autoPublishEnabled: {{ 'true' if auto_publish_enabled else 'false' }}
+        },
+        saving: false,
+
+        async saveSettings() {
+            this.saving = true;
+            const data = new FormData();
+            data.append('default_caption', this.form.defaultCaption);
+            data.append('daily_publish_time', this.form.dailyPublishTime);
+            data.append('auto_publish_enabled', this.form.autoPublishEnabled ? 'true' : 'false');
+
+            try {
+                const res = await fetch('/api/settings', { method: 'POST', body: data });
+                const json = await res.json();
+                if (res.ok) {
+                    alert("Impostazioni salvate con successo!");
+                } else {
+                    alert("Errore: " + (json.detail || "Impossibile salvare"));
+                }
+            } catch (e) {
+                alert("Errore: " + e);
+            } finally {
+                this.saving = false;
+            }
+        },
+
+        async uploadFace(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const data = new FormData();
+            data.append('file', file);
+
+            try {
+                const res = await fetch('/api/faces/upload', { method: 'POST', body: data });
+                const json = await res.json();
+                if (res.ok) {
+                    alert(json.message);
+                    location.reload();
+                } else {
+                    alert("Errore upload: " + (json.detail || "Errore sconosciuto"));
+                }
+            } catch (err) {
+                alert("Errore: " + err);
+            }
+        },
+
+        async deleteFace(filename) {
+            if (!confirm(`Sei sicuro di voler eliminare '${filename}'?`)) return;
+            try {
+                const res = await fetch(`/api/faces/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+                if (res.ok) {
+                    const el = document.getElementById(`face-${filename}`);
+                    if (el) el.remove();
+                }
+            } catch (e) {
+                alert("Errore: " + e);
+            }
+        }
+    }
+}
+</script>
+{% endblock %}
+

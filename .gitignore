@@ -27,3 +27,8 @@ output/
 *.mp4
 kirky.bat
 .vscode/
+
+# Web platform secrets and persistent data
+.env
+data/
+*.db

@@ -1,0 +1,284 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<div x-data="dashboardApp()" x-init="init()" class="space-y-8">
+
+    <!-- Top Status Bar -->
+    <div class="flex flex-wrap items-center justify-between gap-4 bg-[#161b22] border border-[#30363d] p-4 rounded-2xl">
+        <div class="flex flex-wrap items-center gap-3">
+            <span class="text-xs uppercase font-semibold text-gray-400">Integrazioni:</span>
+            
+            {% if status.gdrive %}
+            <span class="badge badge-success gap-1 text-xs py-2 px-3 font-medium">
+                <i class="ph-bold ph-google-drive-logo text-sm"></i> Google Drive Connesso
+            </span>
+            {% else %}
+            <span class="badge badge-warning gap-1 text-xs py-2 px-3 font-medium" title="Configura GDRIVE_FOLDER_ID e service_account.json in .env">
+                <i class="ph-bold ph-warning text-sm"></i> Google Drive Non Configurato
+            </span>
+            {% endif %}
+
+            {% if status.instagram %}
+            <span class="badge badge-info gap-1 text-xs py-2 px-3 font-medium">
+                <i class="ph-bold ph-instagram-logo text-sm"></i> Instagram Pronto
+            </span>
+            {% else %}
+            <span class="badge badge-ghost gap-1 text-xs py-2 px-3 font-medium text-gray-400" title="Imposta INSTAGRAM_USERNAME e PASSWORD in .env">
+                <i class="ph-bold ph-info text-sm"></i> Instagram In Attesa Credenziali
+            </span>
+            {% endif %}
+
+            <span class="badge badge-purple gap-1 text-xs py-2 px-3 font-medium bg-purple-950/60 text-purple-300 border border-purple-800">
+                <i class="ph-bold ph-clock text-sm"></i> Auto-Publish: 1 al giorno ({{ status.publish_time }})
+            </span>
+        </div>
+
+        <div class="flex items-center gap-2">
+            <a href="/queue" class="btn btn-sm btn-outline border-[#30363d] text-gray-300 hover:text-white">
+                <i class="ph-bold ph-queue text-base"></i> Gestisci Coda ({{ stats.queued }})
+            </a>
+        </div>
+    </div>
+
+    <!-- Quick Stats -->
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div class="card bg-[#161b22] border border-[#30363d] p-5 rounded-2xl">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-xs font-semibold uppercase tracking-wider text-gray-400">Media Kirkificati</p>
+                    <p class="text-3xl font-bold text-white mt-1">{{ stats.processed }}</p>
+                </div>
+                <div class="w-12 h-12 rounded-xl bg-purple-950/60 border border-purple-800 flex items-center justify-center text-purple-400">
+                    <i class="ph-bold ph-video text-2xl"></i>
+                </div>
+            </div>
+            <p class="text-xs text-gray-500 mt-3">Pipeline 60 FPS & GFPGAN HD attiva</p>
+        </div>
+
+        <div class="card bg-[#161b22] border border-[#30363d] p-5 rounded-2xl">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-xs font-semibold uppercase tracking-wider text-gray-400">In Coda di Pubblicazione</p>
+                    <p class="text-3xl font-bold text-indigo-400 mt-1">{{ stats.queued }}</p>
+                </div>
+                <div class="w-12 h-12 rounded-xl bg-indigo-950/60 border border-indigo-800 flex items-center justify-center text-indigo-400">
+                    <i class="ph-bold ph-calendar-check text-2xl"></i>
+                </div>
+            </div>
+            <p class="text-xs text-gray-500 mt-3">1 post al giorno programmato automaticamente</p>
+        </div>
+
+        <div class="card bg-[#161b22] border border-[#30363d] p-5 rounded-2xl">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-xs font-semibold uppercase tracking-wider text-gray-400">Pubblicati su Instagram</p>
+                    <p class="text-3xl font-bold text-emerald-400 mt-1">{{ stats.posted }}</p>
+                </div>
+                <div class="w-12 h-12 rounded-xl bg-emerald-950/60 border border-emerald-800 flex items-center justify-center text-emerald-400">
+                    <i class="ph-bold ph-paper-plane-tilt text-2xl"></i>
+                </div>
+            </div>
+            <p class="text-xs text-gray-500 mt-3">Sincronizzati anche su Google Drive</p>
+        </div>
+    </div>
+
+    <!-- Main Creation Form -->
+    <div class="card bg-[#161b22] border border-[#30363d] p-6 rounded-2xl shadow-xl">
+        <div class="flex items-center gap-3 mb-4">
+            <div class="w-10 h-10 rounded-xl bg-gradient-to-r from-pink-500 to-purple-600 flex items-center justify-center text-white">
+                <i class="ph-bold ph-instagram-logo text-xl"></i>
+            </div>
+            <div>
+                <h2 class="text-lg font-bold text-white">Kirkifica Nuovo Reel / Video</h2>
+                <p class="text-xs text-gray-400">Scarica da Instagram via yt-dlp, elabora a 60 FPS con GFPGAN e carica su Google Drive</p>
+            </div>
+        </div>
+
+        <form @submit.prevent="submitJob" class="space-y-4">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div class="md:col-span-2 space-y-4">
+                    <div class="form-control">
+                        <label class="label text-xs font-semibold text-gray-300">Link Instagram Reel / Post</label>
+                        <div class="relative">
+                            <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-gray-400">
+                                <i class="ph-bold ph-link text-lg"></i>
+                            </span>
+                            <input type="url" x-model="form.instagramUrl" placeholder="https://www.instagram.com/reel/C.../" class="input input-bordered w-full pl-10 bg-[#0d1117] border-[#30363d] text-white focus:border-purple-500 focus:outline-none" />
+                        </div>
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label text-xs font-semibold text-gray-300">
+                            <span>Descrizione per il post Instagram (opzionale)</span>
+                            <span class="text-gray-500 text-xs">Se vuota, userà la descrizione predefinita</span>
+                        </label>
+                        <textarea x-model="form.caption" rows="2" placeholder="Lascia vuoto per usare il template standard delle impostazioni..." class="textarea textarea-bordered w-full bg-[#0d1117] border-[#30363d] text-white focus:border-purple-500 text-sm"></textarea>
+                    </div>
+                </div>
+
+                <div class="flex flex-col justify-between p-4 bg-[#0d1117] border border-[#30363d] rounded-xl">
+                    <div>
+                        <p class="text-xs font-semibold text-gray-300 mb-2">Oppure carica file locale</p>
+                        <input type="file" @change="handleFileUpload" class="file-input file-input-bordered file-input-sm w-full bg-[#161b22] border-[#30363d] text-xs" accept="video/*,image/*" />
+                        <p class="text-[11px] text-gray-500 mt-2">Supporta MP4, MOV, MKV, JPG, PNG. Il file verrà elaborato e aggiunto alla coda.</p>
+                    </div>
+
+                    <div class="pt-4 mt-4 border-t border-[#30363d]">
+                        <button type="submit" :disabled="loading" class="btn btn-primary w-full bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 border-none text-white shadow-lg shadow-purple-600/20">
+                            <span x-show="!loading" class="flex items-center gap-2">
+                                <i class="ph-bold ph-play text-base"></i> Avvia Elaborazione & Coda
+                            </span>
+                            <span x-show="loading" class="flex items-center gap-2">
+                                <span class="loading loading-spinner loading-xs"></span> Elaborazione in corso...
+                            </span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </form>
+    </div>
+
+    <!-- Live Jobs Tracker -->
+    <div class="card bg-[#161b22] border border-[#30363d] p-6 rounded-2xl">
+        <div class="flex items-center justify-between mb-4">
+            <h3 class="text-base font-bold text-white flex items-center gap-2">
+                <i class="ph-bold ph-activity text-purple-400"></i> Stato Elaborazioni in Tempo Reale
+            </h3>
+            <button @click="fetchJobs" class="btn btn-ghost btn-xs text-gray-400 hover:text-white">
+                <i class="ph-bold ph-arrows-clockwise"></i> Aggiorna
+            </button>
+        </div>
+
+        <div class="space-y-3">
+            <template x-for="job in jobs" :key="job.id">
+                <div class="p-4 bg-[#0d1117] border border-[#30363d] rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div class="flex-1 space-y-1">
+                        <div class="flex items-center gap-2">
+                            <span class="badge badge-sm font-mono" :class="{
+                                'badge-warning': job.status === 'DOWNLOADING' || job.status === 'PROCESSING',
+                                'badge-info': job.status === 'UPLOADING_GDRIVE' || job.status === 'ENQUEUING',
+                                'badge-success': job.status === 'COMPLETED',
+                                'badge-error': job.status === 'FAILED'
+                            }" x-text="job.status"></span>
+                            <span class="text-xs text-gray-400 truncate max-w-xs md:max-w-md" x-text="job.source_url || 'File Locale'"></span>
+                        </div>
+                        <p class="text-sm font-medium text-gray-200" x-text="job.current_step"></p>
+                        
+                        <!-- Progress bar -->
+                        <div class="w-full bg-[#161b22] rounded-full h-2 mt-2 overflow-hidden border border-[#30363d]">
+                            <div class="bg-gradient-to-r from-purple-500 to-indigo-500 h-2 transition-all duration-300" :style="`width: ${job.progress}%`"></div>
+                        </div>
+                    </div>
+
+                    <div class="flex items-center gap-2">
+                        <template x-if="job.status === 'COMPLETED' && job.output_filename">
+                            <a :href="`/media/${job.output_filename}`" target="_blank" class="btn btn-sm btn-ghost text-purple-400 hover:bg-purple-950/40">
+                                <i class="ph-bold ph-eye text-base"></i> Anteprima
+                            </a>
+                        </template>
+                        <span class="text-xs text-gray-500" x-text="job.created_at"></span>
+                    </div>
+                </div>
+            </template>
+
+            <template x-if="jobs.length === 0">
+                <div class="text-center py-8 text-gray-500 text-sm">
+                    Nessun job attivo al momento. Inserisci un link Reel sopra per iniziare!
+                </div>
+            </template>
+        </div>
+    </div>
+
+    <!-- Recent Activity Log -->
+    <div class="card bg-[#161b22] border border-[#30363d] p-6 rounded-2xl">
+        <h3 class="text-base font-bold text-white flex items-center gap-2 mb-4">
+            <i class="ph-bold ph-list-dashes text-gray-400"></i> Registro Attività Recente
+        </h3>
+        <div class="space-y-2 max-h-60 overflow-y-auto text-xs font-mono">
+            {% for log in recent_logs %}
+            <div class="flex items-start gap-3 p-2 bg-[#0d1117] rounded-lg border border-[#30363d]/50">
+                <span class="text-gray-500">{{ log.created_at.strftime('%H:%M:%S') }}</span>
+                <span class="badge badge-xs {% if log.level == 'SUCCESS' %}badge-success{% elif log.level == 'ERROR' %}badge-error{% else %}badge-info{% endif %}">
+                    {{ log.level }}
+                </span>
+                <span class="text-gray-300 flex-1">{{ log.message }}</span>
+            </div>
+            {% else %}
+            <p class="text-gray-500 text-center py-4">Nessuna attività registrata ancora.</p>
+            {% endfor %}
+        </div>
+    </div>
+
+</div>
+
+<script>
+function dashboardApp() {
+    return {
+        form: {
+            instagramUrl: '',
+            caption: '',
+            file: null
+        },
+        jobs: [],
+        loading: false,
+        pollTimer: null,
+
+        init() {
+            this.fetchJobs();
+            this.pollTimer = setInterval(() => this.fetchJobs(), 3000);
+        },
+
+        handleFileUpload(e) {
+            this.form.file = e.target.files[0];
+        },
+
+        async submitJob() {
+            if (!this.form.instagramUrl && !this.form.file) {
+                alert("Inserisci un link Instagram Reel oppure seleziona un file!");
+                return;
+            }
+
+            this.loading = true;
+            const data = new FormData();
+            if (this.form.instagramUrl) data.append('instagram_url', this.form.instagramUrl);
+            if (this.form.caption) data.append('caption', this.form.caption);
+            if (this.form.file) data.append('file', this.form.file);
+
+            try {
+                const res = await fetch('/api/jobs/create', {
+                    method: 'POST',
+                    body: data
+                });
+                const json = await res.json();
+                if (res.ok) {
+                    this.form.instagramUrl = '';
+                    this.form.caption = '';
+                    this.form.file = null;
+                    await this.fetchJobs();
+                } else {
+                    alert("Errore: " + (json.detail || "Impossibile avviare il job"));
+                }
+            } catch (err) {
+                alert("Errore di connessione: " + err);
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        async fetchJobs() {
+            try {
+                const res = await fetch('/api/jobs');
+                if (res.ok) {
+                    this.jobs = await res.json();
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+    }
+}
+</script>
+{% endblock %}
+
