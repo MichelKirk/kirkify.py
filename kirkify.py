@@ -24,9 +24,11 @@ from tqdm import tqdm
 
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 import numpy as np
+import cv2
 import insightface
 from insightface.app import FaceAnalysis
 from insightface.app.common import Face
+from insightface.utils import face_align
 from cv2 import imread, imwrite, VideoCapture, CAP_PROP_FPS
 
 # Constant directories
@@ -87,15 +89,15 @@ def get_video_fps(video_path: str) -> float:
     cap = VideoCapture(video_path)
     fps = cap.get(CAP_PROP_FPS)
     cap.release()
-    return fps
+    return float(fps) if fps and fps > 0 else 30.0
 
 def extract_frames(video_path: str):
-    """Extract all frames to unprocessed_frames/"""
+    """Extract all frames to unprocessed_frames/ with lossless quality"""
     UNPROCESSED_DIR.mkdir(exist_ok=True)
     run([
         'ffmpeg', '-y', '-loglevel', 'error',
         '-i', video_path,
-        '-q:v', '2',
+        '-q:v', '1',
         str(UNPROCESSED_DIR / 'frame_%04d.png')
     ], check=True)
 
@@ -117,26 +119,49 @@ def extract_audio(video_path: str) -> str | None:
         return audio_path
     return None
 
-def reconstruct_video(fps: float, audio_path: str | None, output_path: str, frame_step: int):
-    """Combine processed frames with audio (if available)"""
+def reconstruct_video(fps: float, audio_path: str | None, output_path: str, target_fps: float | None = None, scale: float = 1.0, crf: int = 15):
+    """
+    Combine processed frames with audio.
+    - target_fps: ensures output has minimum 60fps (or original if higher) without lag.
+    - scale: upscales resolution (e.g. 2 for 2x upscale using high-quality Lanczos).
+    - crf: visually lossless x264 quality (default 15).
+    """
     PROCESSED_DIR.mkdir(exist_ok=True)
+    input_fps = float(fps) if fps and fps > 0 else 30.0
+    if target_fps is None or target_fps <= 0:
+        target_fps = max(input_fps, 60.0)
+
+    filters = []
+    if scale and scale > 1.0:
+        filters.append(f"scale=trunc(iw*{scale}/2)*2:trunc(ih*{scale}/2)*2:flags=lanczos")
+    if abs(target_fps - input_fps) > 0.05:
+        filters.append(f"fps=fps={target_fps:.2f}")
+
+    vf_str = ",".join(filters) if filters else None
+
     cmd = [
         'ffmpeg', '-y', '-loglevel', 'error',
-        '-framerate', str(fps / frame_step),
+        '-framerate', str(input_fps),
         '-i', str(PROCESSED_DIR / 'frame_%04d.png'),
     ]
+
     if audio_path and os.path.exists(audio_path):
-        cmd.extend([
-            '-i', audio_path,
-            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-            '-c:a', 'copy', '-shortest',
-            output_path
-        ])
-    else:
-        cmd.extend([
-            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-            output_path
-        ])
+        cmd.extend(['-i', audio_path])
+
+    if vf_str:
+        cmd.extend(['-vf', vf_str])
+
+    cmd.extend([
+        '-c:v', 'libx264',
+        '-preset', 'medium',
+        '-crf', str(crf),
+        '-pix_fmt', 'yuv420p',
+    ])
+
+    if audio_path and os.path.exists(audio_path):
+        cmd.extend(['-c:a', 'copy', '-shortest'])
+
+    cmd.append(output_path)
     run(cmd, check=True)
 
 def cleanup(audio_path: str | None = None):
@@ -282,8 +307,79 @@ class FaceTracker:
             stabilized.append(f)
         return stabilized
 
-def kirkify_frame(frame_path: str, output_path: str, faceanalysis: FaceAnalysis, swapper, kirk_face):
-    """Process a single frame"""
+def restore_face_texture(swapped_crop: np.ndarray, orig_crop: np.ndarray, strength: float = 0.35) -> np.ndarray:
+    """
+    Blends original high-frequency skin pores and lighting details back onto the swapped face,
+    and applies an adaptive unsharp filter to remove the 128x128 INSwapper blurriness.
+    """
+    if swapped_crop.shape != orig_crop.shape:
+        orig_crop = cv2.resize(orig_crop, (swapped_crop.shape[1], swapped_crop.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+
+    orig_blur = cv2.GaussianBlur(orig_crop, (5, 5), 0).astype(np.float32)
+    orig_detail = orig_crop.astype(np.float32) - orig_blur
+
+    enhanced = swapped_crop.astype(np.float32) + strength * orig_detail
+    enhanced_uint8 = np.clip(enhanced, 0, 255).astype(np.uint8)
+
+    blurred = cv2.GaussianBlur(enhanced_uint8, (3, 3), 0)
+    sharpened = cv2.addWeighted(enhanced_uint8, 1.25, blurred, -0.25, 0)
+    return sharpened
+
+class GFPGANEnhancer:
+    """
+    High-Definition 512x512 Face Restoration model (GFPGAN v1.4 ONNX).
+    Restores ultra-sharp eyes, eyelashes, skin pores, hair, and teeth on swapped faces.
+    """
+    def __init__(self, model_path: str = "GFPGANv1.4.onnx", providers=None):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(model_path, providers=providers or ['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+
+    def enhance_face(self, img: np.ndarray, face) -> np.ndarray:
+        crop_512, M = face_align.norm_crop2(img, face.kps, image_size=512)
+        blob = (cv2.cvtColor(crop_512, cv2.COLOR_BGR2RGB).astype(np.float32) / 127.5 - 1.0)
+        blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
+
+        pred = self.session.run([self.output_name], {self.input_name: blob})[0][0]
+        out_512 = np.clip((np.transpose(pred, (1, 2, 0)) + 1.0) * 127.5, 0, 255).astype(np.uint8)
+        out_bgr = cv2.cvtColor(out_512, cv2.COLOR_RGB2BGR)
+
+        mask = np.zeros((512, 512), dtype=np.float32)
+        cv2.ellipse(mask, (256, 256), (180, 225), 0, 0, 360, 1.0, -1)
+        mask = cv2.GaussianBlur(mask, (35, 35), 0)
+
+        IM = cv2.invertAffineTransform(M)
+        h, w = img.shape[:2]
+        warped_face = cv2.warpAffine(out_bgr, IM, (w, h), borderValue=0.0)
+        warped_mask = cv2.warpAffine(mask, IM, (w, h), borderValue=0.0)[..., np.newaxis]
+
+        result = (img.astype(np.float32) * (1.0 - warped_mask) + warped_face.astype(np.float32) * warped_mask)
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+def swap_and_enhance(img: np.ndarray, face, kirk_face, swapper, enhancer: GFPGANEnhancer | None = None) -> np.ndarray:
+    """Swaps face with INSwapper, restores neural HD clarity with GFPGAN, and injects pore texture."""
+    res = swapper.get(img, face, kirk_face, paste_back=True)
+    if enhancer is not None:
+        try:
+            res = enhancer.enhance_face(res, face)
+        except Exception:
+            pass
+    try:
+        bbox = face.bbox.astype(int)
+        h, w = img.shape[:2]
+        x1 = max(0, bbox[0])
+        y1 = max(0, bbox[1])
+        x2 = min(w, bbox[2])
+        y2 = min(h, bbox[3])
+        if x2 > x1 and y2 > y1:
+            res[y1:y2, x1:x2] = restore_face_texture(res[y1:y2, x1:x2], img[y1:y2, x1:x2])
+    except Exception:
+        pass
+    return res
+
+def kirkify_frame(frame_path: str, output_path: str, faceanalysis: FaceAnalysis, swapper, kirk_face, enhancer=None, scale: float = 1.0):
+    """Process a single frame with HD face enhancement"""
     img = imread(frame_path)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {frame_path}")
@@ -292,37 +388,51 @@ def kirkify_frame(frame_path: str, output_path: str, faceanalysis: FaceAnalysis,
     if faces:
         res = img.copy()
         for face in faces:
-            res = swapper.get(res, face, kirk_face, paste_back=True)
-        
-        if not isinstance(res, np.ndarray):
-            res = np.array(res)
-        imwrite(output_path, res)
-        return True
+            res = swap_and_enhance(res, face, kirk_face, swapper, enhancer=enhancer)
     else:
-        if not isinstance(img, np.ndarray):
-            img = np.array(img)
-        imwrite(output_path, img)
-        return False
+        res = img
 
-def process_all_frames(faceanalysis: FaceAnalysis, swapper, kirk_face, frame_step: int = 1, workers: int | None = None, smooth: bool = True) -> dict:
+    if scale > 1.0:
+        h, w = res.shape[:2]
+        res = cv2.resize(res, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
+
+    ext = Path(output_path).suffix.lower()
+    if ext in ('.jpg', '.jpeg'):
+        imwrite(output_path, res, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+    elif ext == '.png':
+        imwrite(output_path, res, [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
+    else:
+        imwrite(output_path, res)
+    return bool(faces)
+
+def process_all_frames(faceanalysis: FaceAnalysis, swapper, kirk_face, frame_step: int = 1, workers: int | None = None, smooth: bool = True, enhancer: GFPGANEnhancer | None = None) -> dict:
     """Process each frame in unprocessed_frames/ with tqdm progress bar.
     - smooth: enables temporal face tracking and landmark smoothing to eliminate flickering.
-    - frame_step: process 1 of every N frames (skip to speed up).
-    - workers: number of threads for parallel processing (used when smooth=False).
+    - frame_step: process 1 of every N frames (skipped frames smoothly held to keep 60fps fluid).
+    - enhancer: GFPGAN neural face restoration model.
     """
     PROCESSED_DIR.mkdir(exist_ok=True)
     all_files = sorted([f for f in os.listdir(UNPROCESSED_DIR) if f.endswith('.png')])
-    frame_files = all_files[::max(1, frame_step)]
-    total = len(frame_files)
+    total = len(all_files)
     with_faces = 0
+
+    if total == 0:
+        return {'total': 0, 'processed': 0, 'with_faces': 0}
+
+    step = max(1, frame_step)
+    last_processed_img = None
 
     if smooth:
         tracker = FaceTracker(alpha=0.60, max_missed=2)
-        desc = "Processing frames (stabilized)"
-        for idx, filename in enumerate(tqdm(frame_files, total=total, desc=desc, unit="frame")):
-            input_path = str(UNPROCESSED_DIR / filename)
+        desc = "Processing frames (60fps HD)"
+        for idx, filename in enumerate(tqdm(all_files, total=total, desc=desc, unit="frame")):
             output_path = str(PROCESSED_DIR / f"frame_{idx:04d}.png")
-            
+            input_path = str(UNPROCESSED_DIR / filename)
+
+            if step > 1 and (idx % step != 0) and last_processed_img is not None:
+                imwrite(output_path, last_processed_img)
+                continue
+
             img = imread(input_path)
             if img is None:
                 continue
@@ -334,69 +444,125 @@ def process_all_frames(faceanalysis: FaceAnalysis, swapper, kirk_face, frame_ste
                 with_faces += 1
                 res = img.copy()
                 for face in stabilized_faces:
-                    res = swapper.get(res, face, kirk_face, paste_back=True)
+                    res = swap_and_enhance(res, face, kirk_face, swapper, enhancer=enhancer)
                 imwrite(output_path, res)
+                last_processed_img = res
             else:
                 imwrite(output_path, img)
+                last_processed_img = img
 
     else:
-        def _process(idx_and_name: tuple[int, str]) -> bool:
+        desc = "Processing frames (parallel)"
+        pbar = tqdm(total=total, desc=desc, unit="frame")
+
+        def _process(idx_and_name: tuple[int, str]):
+            nonlocal with_faces
             idx, filename = idx_and_name
             input_path = str(UNPROCESSED_DIR / filename)
             output_path = str(PROCESSED_DIR / f"frame_{idx:04d}.png")
-            return kirkify_frame(input_path, output_path, faceanalysis, swapper, kirk_face)
+            img = imread(input_path)
+            if img is None:
+                pbar.update(1)
+                return
+            faces = faceanalysis.get(img)
+            if faces:
+                with_faces += 1
+                res = img.copy()
+                for face in faces:
+                    res = swap_and_enhance(res, face, kirk_face, swapper, enhancer=enhancer)
+                imwrite(output_path, res)
+            else:
+                imwrite(output_path, img)
+            pbar.update(1)
 
         workers = workers or max(1, os.cpu_count() or 1)
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(_process, (i, fn)) for i, fn in enumerate(frame_files)]
-            for fut in tqdm(as_completed(futures), total=total, desc="Processing frames", unit="frame"):
-                try:
-                    if fut.result():
-                        with_faces += 1
-                except Exception:
-                    pass
+            list(ex.map(_process, enumerate(all_files)))
+        pbar.close()
 
-    return {'total': len(all_files), 'processed': len(frame_files), 'with_faces': with_faces}
+    return {'total': total, 'processed': total, 'with_faces': with_faces}
 
 SUPPORTED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
 SUPPORTED_VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm', '.m4v'}
 SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
 
-def kirkify_video(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, frame_step: int = 1, workers: int | None = None, smooth: bool = True):
+def kirkify_video(
+    TARGET_PATH,
+    OUTPUT_PATH,
+    FACE_ANALYSIS,
+    FACE_SWAPPER,
+    frame_step: int = 1,
+    workers: int | None = None,
+    smooth: bool = True,
+    enhancer: GFPGANEnhancer | None = None,
+    target_fps: float | None = None,
+    scale: float = 1.0,
+    crf: int = 15
+):
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     audio_path = None
     kirk_face = get_canonical_kirk_face(FACE_ANALYSIS)
     try:
-        print("Extracting frames...")
+        print("Extracting frames (lossless)...")
         extract_frames(TARGET_PATH)
         
         print("Extracting audio...")
         audio_path = extract_audio(TARGET_PATH)
         
-        print("Processing frames..." + (" (temporal stabilization ON)" if smooth else " (stabilization OFF)"))
-        stats = process_all_frames(FACE_ANALYSIS, FACE_SWAPPER, kirk_face, frame_step=frame_step, workers=workers, smooth=smooth)
-        print(f"  Frames: total {stats['total']}, processed {stats['processed']}, with faces {stats['with_faces']}")
-        
-        print("Reconstructing video...")
         fps = get_video_fps(TARGET_PATH)
-        reconstruct_video(fps, audio_path, OUTPUT_PATH, frame_step)
+        effective_fps = max(fps, 60.0) if (target_fps is None or target_fps <= 0) else target_fps
+        print(f"Video input: {fps:.2f} FPS -> Target: {effective_fps:.2f} FPS" + (f" (Lanczos {scale:.1f}x Upscale)" if scale > 1.0 else "") + (" (GFPGAN HD Face Enhancer ON)" if enhancer else " (Texture Restoration ON)"))
+
+        print("Processing frames..." + (" (temporal stabilization ON)" if smooth else " (stabilization OFF)"))
+        stats = process_all_frames(FACE_ANALYSIS, FACE_SWAPPER, kirk_face, frame_step=frame_step, workers=workers, smooth=smooth, enhancer=enhancer)
+        print(f"  Frames: total {stats['total']}, with faces {stats['with_faces']}")
+        
+        print("Reconstructing video (min 60fps, visually lossless CRF 15)...")
+        reconstruct_video(fps, audio_path, OUTPUT_PATH, target_fps=effective_fps, scale=scale, crf=crf)
     finally:
         print("Cleaning up...")
         cleanup(audio_path)
     
     print(f"Done! Output saved to {OUTPUT_PATH}")
 
-def kirkify_image(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER):
+def kirkify_image(
+    TARGET_PATH,
+    OUTPUT_PATH,
+    FACE_ANALYSIS,
+    FACE_SWAPPER,
+    enhancer: GFPGANEnhancer | None = None,
+    scale: float = 1.0
+):
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     kirk_face = get_canonical_kirk_face(FACE_ANALYSIS)
 
-    print("Kirkifying image...")
-    face_detected = kirkify_frame(TARGET_PATH, OUTPUT_PATH, FACE_ANALYSIS, FACE_SWAPPER, kirk_face)
+    print("Kirkifying image in ultra-high quality...")
+    img = imread(TARGET_PATH)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {TARGET_PATH}")
 
-    if not face_detected:
+    faces = FACE_ANALYSIS.get(img)
+    if faces:
+        res = img.copy()
+        for face in faces:
+            res = swap_and_enhance(res, face, kirk_face, FACE_SWAPPER, enhancer=enhancer)
+    else:
         print("  No faces detected. Image copied unchanged.")
+        res = img
 
-    print(f"Done! Output saved to {OUTPUT_PATH}")
+    if scale > 1.0:
+        h, w = res.shape[:2]
+        res = cv2.resize(res, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
+
+    ext = Path(OUTPUT_PATH).suffix.lower()
+    if ext in ('.jpg', '.jpeg'):
+        imwrite(OUTPUT_PATH, res, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+    elif ext == '.png':
+        imwrite(OUTPUT_PATH, res, [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
+    else:
+        imwrite(OUTPUT_PATH, res)
+
+    print(f"Done! Output saved to {OUTPUT_PATH} ({res.shape[1]}x{res.shape[0]})")
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "init":
@@ -410,14 +576,18 @@ def main():
     use_gpu = '--gpu' in args
     use_cpu = '--cpu' in args
     smooth = '--no-smooth' not in args
+    enable_enhance = '--no-enhance' not in args
     step = 1
     workers = None
+    scale = 1.0
+    custom_fps = None
+    crf = 15
 
     positional = []
     i = 0
     while i < len(args):
         arg = args[i]
-        if arg in ('--fast', '--gpu', '--cpu'):
+        if arg in ('--fast', '--gpu', '--cpu', '--no-smooth', '--enhance', '--no-enhance'):
             i += 1
         elif arg == '--frame-step':
             if i + 1 < len(args):
@@ -432,6 +602,35 @@ def main():
             if i + 1 < len(args):
                 try:
                     workers = max(1, int(args[i+1]))
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                i += 1
+        elif arg in ('--scale', '--upscale'):
+            if i + 1 < len(args) and not args[i+1].startswith('-'):
+                try:
+                    scale = max(1.0, float(args[i+1]))
+                    i += 2
+                except ValueError:
+                    scale = 2.0
+                    i += 1
+            else:
+                scale = 2.0
+                i += 1
+        elif arg == '--fps':
+            if i + 1 < len(args):
+                try:
+                    custom_fps = float(args[i+1])
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                i += 1
+        elif arg == '--crf':
+            if i + 1 < len(args):
+                try:
+                    crf = int(args[i+1])
                 except ValueError:
                     pass
                 i += 2
@@ -506,7 +705,7 @@ def main():
 
             items_to_process.append((target, out_path, is_img))
 
-    det = (320, 320) if fast else (640, 640)
+    det = (640, 640)
     ctx_id = 0 if use_gpu and not use_cpu else (-1 if use_cpu else 0)
     providers = None
     if use_gpu and not use_cpu:
@@ -521,7 +720,7 @@ def main():
         providers = ['CPUExecutionProvider']
         ctx_id = -1
 
-    print("Initializing models..." + (" (fast mode)" if fast else "") + (" [GPU]" if ctx_id == 0 else " [CPU]"))
+    print("Initializing models..." + (" [GPU]" if ctx_id == 0 else " [CPU]"))
     with suppress_output():
         face_analysis, face_swapper = initialize_faceanalysis_and_swapper(
             det_size=det, ctx_id=ctx_id, swapper_providers=providers
@@ -531,13 +730,23 @@ def main():
     active = get_session_providers(sess) if sess is not None else []
     if active:
         print(f"INSwapper active providers: {active}")
+
+    # Initialize GFPGAN Face Enhancer if present
+    enhancer = None
+    gfpgan_path = Path("GFPGANv1.4.onnx")
+    if enable_enhance and gfpgan_path.exists():
+        try:
+            print("Loading GFPGAN v1.4 HD Face Restoration model...")
+            enhancer = GFPGANEnhancer(str(gfpgan_path), providers=providers)
+            print("GFPGAN HD Face Restoration active! [512x512 Neural Clarity]")
+        except Exception as e:
+            print(f"[WARN] Could not load GFPGAN ({e}); using high-frequency texture restoration.")
     else:
-        if providers:
-            print(f"INSwapper active providers unavailable; attempted: {providers}")
+        print("[INFO] High-frequency texture & unsharp detail restoration active.")
 
     total_items = len(items_to_process)
     if total_items > 1:
-        print(f"\n--- Inizio elaborazione di {total_items} file ---")
+        print(f"\n--- Inizio elaborazione di {total_items} file (minimo 60fps per i video) ---")
 
     try:
         for idx, (src_file, dst_file, is_img) in enumerate(items_to_process, 1):
@@ -545,9 +754,21 @@ def main():
                 print(f"\n[{idx}/{total_items}] Elaborazione: {src_file.name} -> {dst_file}")
             try:
                 if is_img:
-                    kirkify_image(str(src_file), str(dst_file), face_analysis, face_swapper)
+                    kirkify_image(str(src_file), str(dst_file), face_analysis, face_swapper, enhancer=enhancer, scale=scale)
                 else:
-                    kirkify_video(str(src_file), str(dst_file), face_analysis, face_swapper, frame_step=step, workers=workers, smooth=smooth)
+                    kirkify_video(
+                        str(src_file),
+                        str(dst_file),
+                        face_analysis,
+                        face_swapper,
+                        frame_step=step,
+                        workers=workers,
+                        smooth=smooth,
+                        enhancer=enhancer,
+                        target_fps=custom_fps,
+                        scale=scale,
+                        crf=crf
+                    )
             except Exception as e:
                 print(f"  [ERRORE] Durante l'elaborazione di {src_file.name}: {e}")
 

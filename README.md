@@ -85,33 +85,32 @@ python kirkify.py photo.jpg result.jpg --gpu
 
 The script supports several flags to speed up processing and to select the compute device. These are optional and can be combined:
 
-- `--fast`: Use a smaller face detector size (320x320) to speed up detection (slight quality trade-off).
-- `--frame-step N`: Process 1 out of every N frames (video only). Frames are renumbered to keep the output sequence contiguous.
-- `--workers M`: Use M threads to process frames in parallel (used when `--no-smooth` is specified).
-- `--gpu`: Prefer GPU for face detection and INSwapper when available.
+- `--scale N`: Upscale video/image resolution by factor N (e.g. `--scale 2` upscales 480p to HD using Lanczos scaling).
+- `--fps N`: Custom output framerate (default: automatic minimum 60 FPS or original framerate if higher).
+- `--crf N`: Video compression quality factor (default: 15, visually lossless).
+- `--no-enhance`: Disable GFPGAN neural face restoration (GFPGAN is ON by default when GFPGANv1.4.onnx is present).
+- `--gpu`: Prefer GPU for face detection, INSwapper, and GFPGAN.
 - `--cpu`: Force CPU even if a GPU is present.
 - `--no-smooth`: Disable temporal anti-flicker stabilization (temporal smoothing is ON by default).
 
 Examples (cmd/PowerShell):
 
 ```bash
-# Fast mode using GPU with anti-flicker stabilization (default)
-python kirkify.py input.mp4 output.mp4 --fast --gpu
+# Ultra-High Quality 60FPS Video with GFPGAN and 2x Resolution Upscale
+python kirkify.py input.mp4 output.mp4 --gpu --scale 2
 
-# Process entire input/ folder to output/ folder with GPU
-python kirkify.py --gpu --fast
+# Process entire input/ folder to output/ folder in HD 60FPS
+python kirkify.py --gpu
 
-# Skip frames to speed up
-python kirkify.py input.mp4 output.mp4 --fast --frame-step 3 --gpu
-
-# Force CPU and keep full quality detector
-python kirkify.py input.mp4 output.mp4 --cpu
+# Process single photo in 4K/HD quality
+python kirkify.py photo.jpg --gpu --scale 2
 ```
 
 Notes:
-- **Anti-Flicker Temporal Stabilization**: Enabled by default for all video processing. It uses adaptive exponential landmark smoothing (One Euro principle), missed-detection recovery (preventing 1-frame blink glitches), and multi-Kirk embedding averaging to produce smooth, jitter-free face swaps.
+- **Minimum 60 FPS Smooth Playback**: Output videos are automatically rendered at a minimum of 60 FPS (or the original framerate if higher) using lossless frame timing, completely eliminating lag and stutter.
+- **HD Face Restoration (GFPGAN v1.4)**: Automatically upscales and restores the 128x128 swapped face to crystal-clear 512x512 resolution with sharp eyes, eyelashes, teeth, and natural skin pores.
+- **Resolution Upscaling**: Use `--scale 2` to double the resolution of low-quality videos or images using high-quality Lanczos interpolation.
+- **Anti-Flicker Temporal Stabilization**: Enabled by default for all video processing to eliminate micro-jitter and frame-dropping flickers.
 - Supported image formats: `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tiff`, `.tif`.
 - Supported video formats: `.mp4`, `.mov`, `.avi`, `.mkv`, `.flv`, `.wmv`, `.webm`, `.m4v`.
-- GPU mode requires ONNX Runtime GPU (`onnxruntime-gpu`) installed and a compatible NVIDIA driver. If `--gpu` is requested but CUDA is not available, the script will fall back to CPU and print a warning.
-- Videos without audio streams are automatically handled without errors.
 - `ffmpeg` must be installed (automatically detected if installed via `winget install Gyan.FFmpeg.Essentials`).

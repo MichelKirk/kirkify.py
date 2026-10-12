@@ -17,6 +17,8 @@ unprocessed_frames/
 tests/
 
 inswapper_128.onnx
+GFPGANv1.4.onnx
+*.onnx
 audio.aac
 
 # Local input/output directories and temporary artifacts
