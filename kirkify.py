@@ -243,7 +243,7 @@ class FaceTracker:
     2. Missed-detection recovery (grace period) preventing single-frame dropped face flicker.
     3. Spatial IoU + centroid tracking to ensure consistent face-to-identity assignment across frames.
     """
-    def __init__(self, alpha: float = 0.60, max_missed: int = 2, iou_thresh: float = 0.25):
+    def __init__(self, alpha: float = 0.85, max_missed: int = 2, iou_thresh: float = 0.25):
         self.alpha = alpha
         self.max_missed = max_missed
         self.iou_thresh = iou_thresh
@@ -288,12 +288,12 @@ class FaceTracker:
                     track = self.tracks[t_idx]
                     det = detected_faces[d_idx]
 
-                    # Adaptive smoothing: snap if large sudden movement, smooth if small jitter
+                    # Responsive tracking: follow head movement directly, filter only micro-jitter
                     diff = np.linalg.norm(det.kps - track['kps'])
-                    if diff > 80:
+                    if diff > 50:
                         a = 1.0
-                    elif diff > 30:
-                        a = 0.85
+                    elif diff > 20:
+                        a = 0.90
                     else:
                         a = self.alpha
 
@@ -332,10 +332,9 @@ class FaceTracker:
             stabilized.append(f)
         return stabilized
 
-def restore_face_texture(swapped_crop: np.ndarray, orig_crop: np.ndarray, strength: float = 0.35) -> np.ndarray:
+def restore_face_texture(swapped_crop: np.ndarray, orig_crop: np.ndarray, strength: float = 0.15) -> np.ndarray:
     """
-    Blends original high-frequency skin pores and lighting details back onto the swapped face,
-    and applies an adaptive unsharp filter to remove the 128x128 INSwapper blurriness.
+    Subtly recovers natural skin texture without harsh unsharp filter halos.
     """
     if swapped_crop.shape != orig_crop.shape:
         orig_crop = cv2.resize(orig_crop, (swapped_crop.shape[1], swapped_crop.shape[0]), interpolation=cv2.INTER_LANCZOS4)
@@ -344,16 +343,12 @@ def restore_face_texture(swapped_crop: np.ndarray, orig_crop: np.ndarray, streng
     orig_detail = orig_crop.astype(np.float32) - orig_blur
 
     enhanced = swapped_crop.astype(np.float32) + strength * orig_detail
-    enhanced_uint8 = np.clip(enhanced, 0, 255).astype(np.uint8)
-
-    blurred = cv2.GaussianBlur(enhanced_uint8, (3, 3), 0)
-    sharpened = cv2.addWeighted(enhanced_uint8, 1.25, blurred, -0.25, 0)
-    return sharpened
+    return np.clip(enhanced, 0, 255).astype(np.uint8)
 
 class GFPGANEnhancer:
     """
     High-Definition 512x512 Face Restoration model (GFPGAN v1.4 ONNX).
-    Restores ultra-sharp eyes, eyelashes, skin pores, hair, and teeth on swapped faces.
+    Restores natural clarity to eyes and mouth, blended with original skin texture to prevent over-smoothing.
     """
     def __init__(self, model_path: str = "GFPGANv1.4.onnx", providers=None):
         import onnxruntime as ort
@@ -361,7 +356,7 @@ class GFPGANEnhancer:
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
 
-    def enhance_face(self, img: np.ndarray, face) -> np.ndarray:
+    def enhance_face(self, img: np.ndarray, face, fidelity: float = 0.55) -> np.ndarray:
         crop_512, M = face_align.norm_crop2(img, face.kps, image_size=512)
         blob = (cv2.cvtColor(crop_512, cv2.COLOR_BGR2RGB).astype(np.float32) / 127.5 - 1.0)
         blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
@@ -369,6 +364,10 @@ class GFPGANEnhancer:
         pred = self.session.run([self.output_name], {self.input_name: blob})[0][0]
         out_512 = np.clip((np.transpose(pred, (1, 2, 0)) + 1.0) * 127.5, 0, 255).astype(np.uint8)
         out_bgr = cv2.cvtColor(out_512, cv2.COLOR_RGB2BGR)
+
+        # Blend with swapped crop according to fidelity to preserve natural skin pores and avoid the porcelain/plastic mask effect
+        if fidelity < 1.0:
+            out_bgr = cv2.addWeighted(out_bgr, float(fidelity), crop_512, float(1.0 - fidelity), 0)
 
         mask = np.zeros((512, 512), dtype=np.float32)
         cv2.ellipse(mask, (256, 256), (180, 225), 0, 0, 360, 1.0, -1)
@@ -382,26 +381,36 @@ class GFPGANEnhancer:
         result = (img.astype(np.float32) * (1.0 - warped_mask) + warped_face.astype(np.float32) * warped_mask)
         return np.clip(result, 0, 255).astype(np.uint8)
 
-def swap_and_enhance(img: np.ndarray, face, kirk_face, swapper, enhancer: GFPGANEnhancer | None = None) -> np.ndarray:
-    """Swaps face with INSwapper, restores neural HD clarity with GFPGAN, and injects pore texture."""
+def swap_and_enhance(
+    img: np.ndarray,
+    face,
+    kirk_face,
+    swapper,
+    enhancer: GFPGANEnhancer | None = None,
+    fidelity: float = 0.55,
+    sharpen: float = 0.0
+) -> np.ndarray:
+    """Swaps face with INSwapper and applies balanced, natural enhancement without artificial over-sharpening."""
     res = swapper.get(img, face, kirk_face, paste_back=True)
     if enhancer is not None:
         try:
-            res = enhancer.enhance_face(res, face)
+            res = enhancer.enhance_face(res, face, fidelity=fidelity)
         except Exception:
             pass
-    try:
-        bbox = face.bbox.astype(int)
-        h, w = img.shape[:2]
-        x1 = max(0, bbox[0])
-        y1 = max(0, bbox[1])
-        x2 = min(w, bbox[2])
-        y2 = min(h, bbox[3])
-        if x2 > x1 and y2 > y1:
-            res[y1:y2, x1:x2] = restore_face_texture(res[y1:y2, x1:x2], img[y1:y2, x1:x2])
-    except Exception:
-        pass
+    elif sharpen > 0.0:
+        try:
+            bbox = face.bbox.astype(int)
+            h, w = img.shape[:2]
+            x1 = max(0, bbox[0])
+            y1 = max(0, bbox[1])
+            x2 = min(w, bbox[2])
+            y2 = min(h, bbox[3])
+            if x2 > x1 and y2 > y1:
+                res[y1:y2, x1:x2] = restore_face_texture(res[y1:y2, x1:x2], img[y1:y2, x1:x2], strength=sharpen)
+        except Exception:
+            pass
     return res
+
 
 def kirkify_frame(frame_path: str, output_path: str, faceanalysis: FaceAnalysis, swapper, kirk_face, enhancer=None, scale: float = 1.0):
     """Process a single frame with HD face enhancement"""
@@ -430,11 +439,23 @@ def kirkify_frame(frame_path: str, output_path: str, faceanalysis: FaceAnalysis,
         imwrite(output_path, res)
     return bool(faces)
 
-def process_all_frames(faceanalysis: FaceAnalysis, swapper, kirk_face, frame_step: int = 1, workers: int | None = None, smooth: bool = True, enhancer: GFPGANEnhancer | None = None) -> dict:
+def process_all_frames(
+    faceanalysis: FaceAnalysis,
+    swapper,
+    kirk_face,
+    frame_step: int = 1,
+    workers: int | None = None,
+    smooth: bool = True,
+    enhancer: GFPGANEnhancer | None = None,
+    fidelity: float = 0.55,
+    tracker_alpha: float = 0.85
+) -> dict:
     """Process each frame in unprocessed_frames/ with tqdm progress bar.
     - smooth: enables temporal face tracking and landmark smoothing to eliminate flickering.
     - frame_step: process 1 of every N frames (skipped frames smoothly held to keep 60fps fluid).
     - enhancer: GFPGAN neural face restoration model.
+    - fidelity: blending strength of GFPGAN (0.5-0.6 keeps natural skin texture).
+    - tracker_alpha: responsiveness of face tracking (0.85 = crisp and responsive).
     """
     PROCESSED_DIR.mkdir(exist_ok=True)
     all_files = sorted([f for f in os.listdir(UNPROCESSED_DIR) if f.endswith('.png')])
@@ -448,7 +469,7 @@ def process_all_frames(faceanalysis: FaceAnalysis, swapper, kirk_face, frame_ste
     last_processed_img = None
 
     if smooth:
-        tracker = FaceTracker(alpha=0.60, max_missed=2)
+        tracker = FaceTracker(alpha=tracker_alpha, max_missed=2)
         desc = "Processing frames (60fps HD)"
         for idx, filename in enumerate(tqdm(all_files, total=total, desc=desc, unit="frame")):
             output_path = str(PROCESSED_DIR / f"frame_{idx:04d}.png")
@@ -469,7 +490,7 @@ def process_all_frames(faceanalysis: FaceAnalysis, swapper, kirk_face, frame_ste
                 with_faces += 1
                 res = img.copy()
                 for face in stabilized_faces:
-                    res = swap_and_enhance(res, face, kirk_face, swapper, enhancer=enhancer)
+                    res = swap_and_enhance(res, face, kirk_face, swapper, enhancer=enhancer, fidelity=fidelity)
                 imwrite(output_path, res)
                 last_processed_img = res
             else:
@@ -494,7 +515,7 @@ def process_all_frames(faceanalysis: FaceAnalysis, swapper, kirk_face, frame_ste
                 with_faces += 1
                 res = img.copy()
                 for face in faces:
-                    res = swap_and_enhance(res, face, kirk_face, swapper, enhancer=enhancer)
+                    res = swap_and_enhance(res, face, kirk_face, swapper, enhancer=enhancer, fidelity=fidelity)
                 imwrite(output_path, res)
             else:
                 imwrite(output_path, img)
@@ -521,6 +542,8 @@ def kirkify_video(
     crf: int = 15,
     kirk_face: Face | None = None,
     source_face: Path | str = KIRKS_DIR,
+    fidelity: float = 0.55,
+    tracker_alpha: float = 0.85,
 ):
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     audio_path = None
@@ -538,7 +561,17 @@ def kirkify_video(
         print(f"Video input: {fps:.2f} FPS -> Target: {effective_fps:.2f} FPS" + (f" (Lanczos {scale:.1f}x Upscale)" if scale > 1.0 else "") + (" (GFPGAN HD Face Enhancer ON)" if enhancer else " (Texture Restoration ON)"))
 
         print("Processing frames..." + (" (temporal stabilization ON)" if smooth else " (stabilization OFF)"))
-        stats = process_all_frames(FACE_ANALYSIS, FACE_SWAPPER, kirk_face, frame_step=frame_step, workers=workers, smooth=smooth, enhancer=enhancer)
+        stats = process_all_frames(
+            FACE_ANALYSIS,
+            FACE_SWAPPER,
+            kirk_face,
+            frame_step=frame_step,
+            workers=workers,
+            smooth=smooth,
+            enhancer=enhancer,
+            fidelity=fidelity,
+            tracker_alpha=tracker_alpha
+        )
         print(f"  Frames: total {stats['total']}, with faces {stats['with_faces']}")
         
         print("Reconstructing video (min 60fps, visually lossless CRF 15)...")
@@ -558,6 +591,7 @@ def kirkify_image(
     scale: float = 1.0,
     kirk_face: Face | None = None,
     source_face: Path | str = KIRKS_DIR,
+    fidelity: float = 0.55,
 ):
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     if kirk_face is None:
@@ -572,10 +606,11 @@ def kirkify_image(
     if faces:
         res = img.copy()
         for face in faces:
-            res = swap_and_enhance(res, face, kirk_face, FACE_SWAPPER, enhancer=enhancer)
+            res = swap_and_enhance(res, face, kirk_face, FACE_SWAPPER, enhancer=enhancer, fidelity=fidelity)
     else:
         print("  No faces detected. Image copied unchanged.")
         res = img
+
 
     if scale > 1.0:
         h, w = res.shape[:2]
@@ -610,6 +645,8 @@ def main():
     custom_fps = None
     crf = 15
     source_face_path = KIRKS_DIR
+    fidelity = 0.55
+    tracker_alpha = 0.85
 
     positional = []
     i = 0
@@ -623,6 +660,25 @@ def main():
                 i += 2
             else:
                 i += 1
+        elif arg in ('--fidelity', '--blend', '--strength'):
+            if i + 1 < len(args):
+                try:
+                    fidelity = max(0.0, min(1.0, float(args[i+1])))
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                i += 1
+        elif arg == '--tracker-alpha':
+            if i + 1 < len(args):
+                try:
+                    tracker_alpha = max(0.1, min(1.0, float(args[i+1])))
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                i += 1
+
         elif arg == '--frame-step':
             if i + 1 < len(args):
                 try:
@@ -799,7 +855,8 @@ def main():
                         face_swapper,
                         enhancer=enhancer,
                         scale=scale,
-                        kirk_face=canonical_kirk_face
+                        kirk_face=canonical_kirk_face,
+                        fidelity=fidelity
                     )
                 else:
                     kirkify_video(
@@ -814,8 +871,11 @@ def main():
                         target_fps=custom_fps,
                         scale=scale,
                         crf=crf,
-                        kirk_face=canonical_kirk_face
+                        kirk_face=canonical_kirk_face,
+                        fidelity=fidelity,
+                        tracker_alpha=tracker_alpha
                     )
+
             except Exception as e:
                 print(f"  [ERRORE] Durante l'elaborazione di {src_file.name}: {e}")
 
