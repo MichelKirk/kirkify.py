@@ -132,6 +132,9 @@ Notes:
 - **HD Face Restoration (GFPGAN v1.4)**: Automatically upscales and restores the 128x128 swapped face to crystal-clear 512x512 resolution with sharp eyes, eyelashes, teeth, and natural skin pores.
 - **Resolution Upscaling**: Use `--scale 2` to double the resolution of low-quality videos or images using high-quality Lanczos interpolation.
 - **Anti-Flicker Temporal Stabilization**: Enabled by default for all video processing to eliminate micro-jitter and frame-dropping flickers.
+- **Supporto Documenti PDF Multi-Pagina**: Elabora automaticamente file PDF (`.pdf`), eseguendo il face-swap su ogni pagina in cui sono presenti volti e preservando intatte le pagine vettoriali originali senza volti.
 - Supported image formats: `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tiff`, `.tif`.
 - Supported video formats: `.mp4`, `.mov`, `.avi`, `.mkv`, `.flv`, `.wmv`, `.webm`, `.m4v`.
+- Supported document formats: `.pdf` (richiede `pymupdf`).
 - `ffmpeg` must be installed (automatically detected if installed via `winget install Gyan.FFmpeg.Essentials`).
+

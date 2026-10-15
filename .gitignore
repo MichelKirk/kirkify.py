@@ -24,6 +24,13 @@ audio.aac
 # Local input/output directories and temporary artifacts
 input/
 output/
+output_*/
 *.mp4
 kirky.bat
+
 .vscode/
+
+# Web platform secrets and persistent data
+.env
+data/
+*.db
