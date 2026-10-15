@@ -42,12 +42,19 @@ def run_job_pipeline(job_id: str, custom_caption: Optional[str] = None):
 
         # Determine media type and output path
         ext = Path(job.input_path).suffix.lower()
-        is_video = ext in ('.mp4', '.mov', '.avi', '.mkv', '.webm')
-        job.media_type = "video" if is_video else "image"
+        if ext in ('.mp4', '.mov', '.avi', '.mkv', '.webm'):
+            job.media_type = "video"
+            output_filename = f"kirkified_{Path(job.input_path).stem}.mp4"
+        elif ext == '.pdf':
+            job.media_type = "pdf"
+            output_filename = f"kirkified_{Path(job.input_path).stem}.pdf"
+        else:
+            job.media_type = "image"
+            output_filename = f"kirkified_{Path(job.input_path).stem}.jpg"
 
-        output_filename = f"kirkified_{Path(job.input_path).stem}.mp4" if is_video else f"kirkified_{Path(job.input_path).stem}.jpg"
         output_path = str(settings.PROCESSED_DIR / output_filename)
         job.output_path = output_path
+
 
         # Step 2: Kirkify Processing
         job.status = "PROCESSING"

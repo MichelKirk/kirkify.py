@@ -84,6 +84,20 @@ def process_media(
         )
         if progress_callback:
             progress_callback(100.0, "Completato!")
+    elif ext in kirkify.SUPPORTED_DOCUMENT_EXTS:
+        if progress_callback:
+            progress_callback(30.0, "Elaborazione documento PDF...")
+        kirkify.kirkify_pdf(
+            TARGET_PATH=input_path,
+            OUTPUT_PATH=output_path,
+            FACE_ANALYSIS=face_analysis,
+            FACE_SWAPPER=face_swapper,
+            enhancer=enhancer,
+            scale=effective_scale,
+            kirk_face=canonical_face
+        )
+        if progress_callback:
+            progress_callback(100.0, "Completato!")
     elif ext in kirkify.SUPPORTED_VIDEO_EXTS:
         if progress_callback:
             progress_callback(20.0, "Elaborazione video (60 FPS HD)...")
@@ -105,6 +119,7 @@ def process_media(
             progress_callback(100.0, "Completato!")
     else:
         raise ValueError(f"Formato non supportato: {ext}")
+
 
     return output_path
 

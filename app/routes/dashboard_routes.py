@@ -60,6 +60,13 @@ async def serve_media(
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File non trovato")
 
-    mime = "video/mp4" if filename.lower().endswith((".mp4", ".mov")) else "image/jpeg"
+    ext = filename.lower()
+    if ext.endswith((".mp4", ".mov", ".mkv", ".webm")):
+        mime = "video/mp4"
+    elif ext.endswith(".pdf"):
+        mime = "application/pdf"
+    else:
+        mime = "image/jpeg"
     return FileResponse(file_path, media_type=mime)
+
 

@@ -34,10 +34,17 @@
                         {% if post.media_type == 'video' %}
                         <video src="/media/{{ post.media_path | basename }}" class="w-full h-full object-cover" preload="metadata"></video>
                         <span class="absolute bottom-1 right-1 badge badge-xs badge-neutral text-[10px] font-mono">VIDEO</span>
+                        {% elif post.media_type == 'pdf' %}
+                        <a href="/media/{{ post.media_path | basename }}" target="_blank" class="flex flex-col items-center justify-center text-red-400 hover:text-red-300">
+                            <i class="ph-bold ph-file-pdf text-3xl"></i>
+                            <span class="text-[10px] font-mono text-gray-400 mt-1">APRI PDF</span>
+                        </a>
+                        <span class="absolute bottom-1 right-1 badge badge-xs badge-error text-[10px] font-mono">PDF</span>
                         {% else %}
                         <img src="/media/{{ post.media_path | basename }}" class="w-full h-full object-cover" alt="Media" />
                         <span class="absolute bottom-1 right-1 badge badge-xs badge-neutral text-[10px] font-mono">FOTO</span>
                         {% endif %}
+
                     </div>
 
                     <div class="flex-1">

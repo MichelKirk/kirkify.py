@@ -28,7 +28,12 @@ def upload_to_google_drive(file_path: str, custom_name: Optional[str] = None) ->
         service = build('drive', 'v3', credentials=creds)
 
         file_name = custom_name or Path(file_path).name
-        mime_type = 'video/mp4' if file_path.lower().endswith('.mp4') else 'image/jpeg'
+        if file_path.lower().endswith(('.mp4', '.mov', '.mkv', '.webm')):
+            mime_type = 'video/mp4'
+        elif file_path.lower().endswith('.pdf'):
+            mime_type = 'application/pdf'
+        else:
+            mime_type = 'image/jpeg'
 
         file_metadata = {
             'name': file_name,

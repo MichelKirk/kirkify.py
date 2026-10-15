@@ -38,7 +38,9 @@ KIRKS_DIR = Path('kirks')
 
 SUPPORTED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
 SUPPORTED_VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm', '.m4v'}
-SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
+SUPPORTED_DOCUMENT_EXTS = {'.pdf'}
+SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS | SUPPORTED_DOCUMENT_EXTS
+
 
 # Utilities for ONNX Runtime/GPU verification
 def ort_available_and_providers() -> tuple[bool, list[str]]:
@@ -178,6 +180,25 @@ def cleanup(audio_path: str | None = None):
         except OSError:
             pass
 
+def _detect_faces_with_padding_fallback(faceanalysis: FaceAnalysis, img: np.ndarray):
+    """
+    Detects faces in an image. If no face is found (common on tightly-cropped close-up portraits),
+    pads the image borders and retries detection.
+    """
+    faces = faceanalysis.get(img)
+    if faces:
+        return faces
+    h, w = img.shape[:2]
+    pad_y, pad_x = int(h * 0.35), int(w * 0.35)
+    padded = cv2.copyMakeBorder(img, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_REPLICATE)
+    return faceanalysis.get(padded)
+
+def _face_area(face) -> float:
+    bbox = getattr(face, 'bbox', None)
+    if bbox is None or len(bbox) < 4:
+        return 0.0
+    return float(max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1]))
+
 def get_canonical_kirk_face(faceanalysis: FaceAnalysis, source: Path | str = KIRKS_DIR):
     """
     Computes an averaged, normalized identity embedding from reference face images.
@@ -205,26 +226,42 @@ def get_canonical_kirk_face(faceanalysis: FaceAnalysis, source: Path | str = KIR
     if not candidates:
         raise FileNotFoundError(f"Nessuna immagine trovata in '{source_p}'. Inserisci una o piu' foto (.jpg, .png, .webp) del volto da applicare.")
 
-    embeddings = []
-    best_face = None
-    best_score = -1.0
+    detected_records = []
 
     for img_path in candidates:
         img = imread(str(img_path))
         if img is None:
             continue
-        faces = faceanalysis.get(img)
+        faces = _detect_faces_with_padding_fallback(faceanalysis, img)
         if faces:
-            # Pick highest confidence detected face in the reference photo
-            face = max(faces, key=lambda f: getattr(f, 'det_score', 0.0))
-            embeddings.append(face.normed_embedding)
-            score = getattr(face, 'det_score', 0.0)
+            valid_faces = [f for f in faces if getattr(f, 'det_score', 0.0) >= 0.55] or faces
+            face = max(valid_faces, key=lambda f: _face_area(f) * float(getattr(f, 'det_score', 0.5)))
+            emb = face.normed_embedding
+            score = float(getattr(face, 'det_score', 0.0))
+            detected_records.append((face, emb, score))
+
+    if not detected_records:
+        raise RuntimeError(f"Impossibile rilevare un volto nelle immagini di riferimento in '{source_p}'. Assicurati che il viso sia ben visibile e illuminato.")
+
+    all_embs = np.array([r[1] for r in detected_records])
+    mean_init = np.mean(all_embs, axis=0)
+    mean_init /= np.linalg.norm(mean_init)
+
+    embeddings = []
+    best_face = None
+    best_score = -1.0
+
+    for face, emb, score in detected_records:
+        sim = float(np.dot(emb, mean_init))
+        if sim >= 0.45 or len(detected_records) <= 2:
+            embeddings.append(emb)
             if score > best_score:
                 best_score = score
                 best_face = face
 
-    if best_face is None or not embeddings:
-        raise RuntimeError(f"Impossibile rilevare un volto nelle immagini di riferimento in '{source_p}'. Assicurati che il viso sia ben visibile e illuminato.")
+    if not embeddings or best_face is None:
+        embeddings = [r[1] for r in detected_records]
+        best_face = max(detected_records, key=lambda r: r[2])[0]
 
     avg_emb = np.mean(embeddings, axis=0)
     avg_emb /= np.linalg.norm(avg_emb)
@@ -232,6 +269,7 @@ def get_canonical_kirk_face(faceanalysis: FaceAnalysis, source: Path | str = KIR
     canonical_face = Face(best_face)
     canonical_face.embedding = avg_emb
     return canonical_face
+
 
 
 class FaceTracker:
@@ -626,6 +664,83 @@ def kirkify_image(
 
     print(f"Done! Output saved to {OUTPUT_PATH} ({res.shape[1]}x{res.shape[0]})")
 
+def kirkify_pdf(
+    TARGET_PATH: str,
+    OUTPUT_PATH: str,
+    FACE_ANALYSIS: FaceAnalysis,
+    FACE_SWAPPER,
+    enhancer: GFPGANEnhancer | None = None,
+    scale: float = 1.0,
+    kirk_face: Face | None = None,
+    source_face: Path | str = KIRKS_DIR,
+    fidelity: float = 0.55,
+    dpi: int = 200,
+):
+    """Processes a PDF document: renders each page, swaps faces, and reconstructs the PDF."""
+    try:
+        import pymupdf
+    except ImportError:
+        raise ImportError("Il supporto per i file PDF richiede la libreria 'pymupdf'. Installala con: pip install pymupdf")
+
+    Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
+    if kirk_face is None:
+        kirk_face = get_canonical_kirk_face(FACE_ANALYSIS, source=source_face)
+
+    print(f"Kirkifying PDF: {TARGET_PATH} -> {OUTPUT_PATH}...")
+    src_doc = pymupdf.open(TARGET_PATH)
+    out_doc = pymupdf.open()
+
+    total_pages = len(src_doc)
+    pages_with_faces = 0
+
+    desc = f"Processing PDF ({total_pages} pag{'e' if total_pages == 1 else 'ine'})"
+    for page_idx in tqdm(range(total_pages), desc=desc, unit="pag"):
+        page = src_doc[page_idx]
+
+        # Render page at high quality (200 DPI gives crisp resolution for document reading & face swapping)
+        zoom = dpi / 72.0
+        mat = pymupdf.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+
+        # Convert to OpenCV BGR
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, 3))
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        faces = FACE_ANALYSIS.get(img)
+        if faces:
+            pages_with_faces += 1
+            res = img.copy()
+            for face in faces:
+                res = swap_and_enhance(res, face, kirk_face, FACE_SWAPPER, enhancer=enhancer, fidelity=fidelity)
+
+            if scale > 1.0:
+                h, w = res.shape[:2]
+                res = cv2.resize(res, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
+
+            # Encode swapped page to JPEG bytes in memory with high quality
+            success, enc_bytes = cv2.imencode('.jpg', res, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if success:
+                img_doc = pymupdf.open(stream=enc_bytes.tobytes(), filetype="jpeg")
+                pdf_bytes = img_doc.convert_to_pdf()
+                img_pdf = pymupdf.open("pdf", pdf_bytes)
+                out_doc.insert_pdf(img_pdf)
+                img_doc.close()
+                img_pdf.close()
+            else:
+                out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
+        else:
+            # If no faces on this page, copy original vector page directly (preserves 100% vector text)
+            out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
+
+    # Save output PDF with compression
+    out_doc.save(OUTPUT_PATH, garbage=3, deflate=True)
+    out_doc.close()
+    src_doc.close()
+
+    print(f"Done! PDF salvato in {OUTPUT_PATH} (Pagine con volti modificati: {pages_with_faces}/{total_pages})")
+    return pages_with_faces
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "init":
         initialize_faceanalysis_and_swapper()
@@ -737,7 +852,17 @@ def main():
     input_dir_default.mkdir(exist_ok=True)
     output_dir_default.mkdir(exist_ok=True)
 
-    items_to_process: list[tuple[Path, Path, bool]] = []  # (src_path, dst_path, is_image)
+    def get_media_type(p: Path) -> str:
+        ext = p.suffix.lower()
+        if ext in SUPPORTED_IMAGE_EXTS:
+            return 'image'
+        elif ext in SUPPORTED_DOCUMENT_EXTS:
+            return 'pdf'
+        elif ext in SUPPORTED_VIDEO_EXTS:
+            return 'video'
+        return 'unknown'
+
+    items_to_process: list[tuple[Path, Path, str]] = []  # (src_path, dst_path, media_type)
 
     if len(positional) == 0:
         # Batch mode: process all files in input/ -> output/
@@ -747,15 +872,15 @@ def main():
         ])
         if not valid_files:
             print("Nessun file trovato da elaborare.")
-            print(f"Inserisci video o immagini nella cartella: {input_dir_default.resolve()}")
+            print(f"Inserisci video, immagini o documenti PDF nella cartella: {input_dir_default.resolve()}")
             print("Formati supportati:")
-            print(f"  Immagini: {', '.join(sorted(SUPPORTED_IMAGE_EXTS))}")
-            print(f"  Video:    {', '.join(sorted(SUPPORTED_VIDEO_EXTS))}")
+            print(f"  Immagini:   {', '.join(sorted(SUPPORTED_IMAGE_EXTS))}")
+            print(f"  Video:      {', '.join(sorted(SUPPORTED_VIDEO_EXTS))}")
+            print(f"  Documenti:  {', '.join(sorted(SUPPORTED_DOCUMENT_EXTS))}")
             return
         
         for f in valid_files:
-            is_img = f.suffix.lower() in SUPPORTED_IMAGE_EXTS
-            items_to_process.append((f, output_dir_default / f.name, is_img))
+            items_to_process.append((f, output_dir_default / f.name, get_media_type(f)))
 
     else:
         target = Path(positional[0])
@@ -774,13 +899,11 @@ def main():
                 print(f"Nessun file supportato trovato nella cartella '{target}'.")
                 return
             for f in valid_files:
-                is_img = f.suffix.lower() in SUPPORTED_IMAGE_EXTS
-                items_to_process.append((f, out_dir / f.name, is_img))
+                items_to_process.append((f, out_dir / f.name, get_media_type(f)))
         else:
             ext = target.suffix.lower()
             if ext not in SUPPORTED_EXTS:
                 raise ValueError(f"Formato non supportato: {ext}. Formati supportati: {SUPPORTED_EXTS}")
-            is_img = ext in SUPPORTED_IMAGE_EXTS
 
             if len(positional) > 1:
                 dest = Path(positional[1])
@@ -793,7 +916,8 @@ def main():
             else:
                 out_path = output_dir_default / target.name
 
-            items_to_process.append((target, out_path, is_img))
+            items_to_process.append((target, out_path, get_media_type(target)))
+
 
     det = (640, 640)
     ctx_id = 0 if use_gpu and not use_cpu else (-1 if use_cpu else 0)
@@ -843,12 +967,23 @@ def main():
         print(f"\n--- Inizio elaborazione di {total_items} file (minimo 60fps per i video) ---")
 
     try:
-        for idx, (src_file, dst_file, is_img) in enumerate(items_to_process, 1):
+        for idx, (src_file, dst_file, m_type) in enumerate(items_to_process, 1):
             if total_items > 1:
                 print(f"\n[{idx}/{total_items}] Elaborazione: {src_file.name} -> {dst_file}")
             try:
-                if is_img:
+                if m_type == 'image':
                     kirkify_image(
+                        str(src_file),
+                        str(dst_file),
+                        face_analysis,
+                        face_swapper,
+                        enhancer=enhancer,
+                        scale=scale,
+                        kirk_face=canonical_kirk_face,
+                        fidelity=fidelity
+                    )
+                elif m_type == 'pdf':
+                    kirkify_pdf(
                         str(src_file),
                         str(dst_file),
                         face_analysis,
@@ -875,6 +1010,7 @@ def main():
                         fidelity=fidelity,
                         tracker_alpha=tracker_alpha
                     )
+
 
             except Exception as e:
                 print(f"  [ERRORE] Durante l'elaborazione di {src_file.name}: {e}")
